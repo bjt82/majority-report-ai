@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -78,6 +78,9 @@ PROVIDERS = {
                    model=secret("GEMINI_MODEL", "gemini-3.8-flash")),
     "Groq": dict(kind="openai", key="GROQ_API_KEY", vision=False,
                  base_url="https://api.groq.com/openai/v1",
+                 # 무료 등급은 분당 토큰이 작아(gpt-oss-120b 8K) 요청 하나가 그 안에 들어가야 함
+                 max_tokens=int(secret("GROQ_MAX_TOKENS", 2048)),
+                 max_input_chars=int(secret("GROQ_MAX_INPUT_CHARS", 5000)),
                  model=secret("GROQ_MODEL", "openai/gpt-oss-120b"),
                  exclude=("whisper", "tts", "guard", "playai", "orpheus", "distil")),
     "Mistral": dict(kind="openai", key="MISTRAL_API_KEY", vision=False,
@@ -371,7 +374,7 @@ async def call_openai_compat(p, model, system, text, images, search=False, on_te
     async with AsyncOpenAI(api_key=secret(p["key"]), base_url=p["base_url"]) as client:
         if on_text:
             stream = await client.chat.completions.create(
-                model=model, max_tokens=8000, stream=True,
+                model=model, max_tokens=p.get("max_tokens", 8000), stream=True,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": text}])
             out = []
             async for ev in stream:
@@ -381,7 +384,7 @@ async def call_openai_compat(p, model, system, text, images, search=False, on_te
                     on_text(piece)
             return "".join(out)
         resp = await client.chat.completions.create(
-            model=model, max_tokens=8000,
+            model=model, max_tokens=p.get("max_tokens", 8000),
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": text}],
         )
@@ -447,8 +450,11 @@ async def ask(role, name, model, system, text, images, log=None, search=False,
                 await asyncio.sleep(RETRY_WAIT_SEC)
                 continue
             msg = f"{type(e).__name__}: {e}"
+            low = msg.lower()
+            too_large = any(k in low for k in ("413", "too large", "context_length", "maximum context",
+                                                "context window", "too long"))
             return {"role": role, "name": name, "model": model, "ok": False, "text": msg,
-                    "quota": is_quota(msg), "daily": is_daily(msg),
+                    "quota": is_quota(msg) and not too_large, "daily": is_daily(msg), "too_large": too_large,
                     "sec": round(time.perf_counter() - t0, 1)}
 
 
@@ -492,23 +498,38 @@ def brief_prompt(ui: UserInput, search: bool = False) -> str:
 5. 좋은 답의 조건: 답변 범위, 형식, 피해야 할 것{search_part}"""
 
 
-def judge_prompt(ui: UserInput, brief: str) -> str:
-    parts = [ui.base_text()]
-    if brief:
-        parts.append(f"<brief from=\"허브 AI\">\n{brief}\n</brief>")
-    parts.append("허브가 정리한 쟁점을 빠짐없이 다루면서 질문에 답하세요.")
-    return "\n\n".join(parts)
+def fit(text: str, limit: int) -> str:
+    """limit 글자를 넘으면 앞 60%·뒤 40%만 남기고 가운데를 줄임."""
+    if not limit or len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    return text[:head] + "\n…(중략)…\n" + text[-(limit - head):]
 
 
-def debate_prompt(ui: UserInput, brief: str, own: dict, other: dict) -> str:
-    return f"""{judge_prompt(ui, brief)}
+def judge_prompt(ui: UserInput, brief: str, limit: int = 0) -> str:
+    """limit이 있으면(입력 한도가 작은 무료 판단자) 이전 대화·문서 원문 대신 허브 브리프만 전달.
+    브리프에 이미 '이전 대화와의 연결'과 '첨부 자료 요약'이 들어 있음."""
+    if limit and brief:
+        head = (f"(오늘 날짜: {today()}.)\n\n<question>\n{fit(ui.prompt, limit // 5)}\n</question>\n\n"
+                "(이전 대화와 첨부 자료는 허브가 아래 브리프에 요약했습니다.)")
+        body = f"<brief from=\"허브 AI\">\n{fit(brief, limit - len(head) - 200)}\n</brief>"
+    else:
+        head = ui.base_text()
+        body = f"<brief from=\"허브 AI\">\n{brief}\n</brief>" if brief else ""
+    parts = [head] + ([body] if body else []) + ["허브가 정리한 쟁점을 빠짐없이 다루면서 질문에 답하세요."]
+    return fit("\n\n".join(parts), limit)
+
+
+def debate_prompt(ui: UserInput, brief: str, own: dict, other: dict, limit: int = 0) -> str:
+    each = limit // 4 if limit else 0           # 작은 판단자: 질문·브리프 절반, 두 답이 각 1/4
+    return f"""{judge_prompt(ui, brief, limit // 2 if limit else 0)}
 
 <my_answer>
-{own['text']}
+{fit(own['text'], each)}
 </my_answer>
 
 <opponent_answer>
-{other['text']}
+{fit(other['text'], each)}
 </opponent_answer>
 
 상대 판단자의 답을 보고 아래 형식으로 토론하세요.
@@ -570,7 +591,19 @@ def resolve_model(name: str):
 
 def clock(ts: float) -> str:
     """제외 해제 시각을 사용자 시간대(기본 한국)로 표시. 서버는 UTC로 돌기 때문."""
-    return datetime.fromtimestamp(ts, ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))).strftime("%H:%M")
+    tz = ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))
+    when = datetime.fromtimestamp(ts, tz)
+    day = (when.date() - datetime.now(tz).date()).days
+    return ("" if day <= 0 else "내일 " if day == 1 else when.strftime("%m/%d ")) + when.strftime("%H:%M")
+
+
+def cooldown_until(name: str, r: dict) -> float:
+    """한도 초과한 AI를 언제까지 뺄지. Gemini 하루 한도는 태평양 시간 자정에 초기화됨."""
+    if r.get("daily") and PROVIDERS[name]["kind"] == "gemini":
+        pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+        reset = datetime.combine(pt.date() + timedelta(days=1), datetime.min.time(), tzinfo=pt.tzinfo)
+        return reset.timestamp() + 60
+    return time.time() + (COOLDOWN_DAY_SEC if r.get("daily") else COOLDOWN_MIN_SEC)
 
 
 def cooled(name: str, cooldowns: dict) -> bool:
@@ -626,25 +659,40 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         note(f"⚠️ {role_label[slot]}({old}) {why} → {who}")
         return True
 
-    async def judge_call(slot, label, system, text, key):
+    def limit_of(name, factor=1.0):
+        return int(PROVIDERS[name].get("max_input_chars", 0) * factor)
+
+    async def judge_call(slot, label, system, make, key):
+        """make(입력 한도) → 그 판단자에게 맞는 크기의 프롬프트."""
         board.start(key, names[slot])
-        r = await ask(label, names[slot], mdl[slot], system, text, imgs, log, timeout=judge_timeout)
+        r = await ask(label, names[slot], mdl[slot], system, make(limit_of(names[slot])), imgs, log,
+                      timeout=judge_timeout)
+        shrunk = False
         while not r["ok"]:
             failed = names[slot]
+            if r.get("too_large") and not shrunk:     # 요청이 너무 크면 더 줄여서 한 번 더
+                shrunk = True
+                small = limit_of(failed, 0.5) or 6000
+                log(f"✂️ {label}({failed}) 요청이 커서 {small:,}자로 줄여 다시 시도")
+                r = await ask(label, failed, mdl[slot], system, make(small), imgs, log, timeout=judge_timeout)
+                continue
             if r.get("timeout"):              # 느린 판단자는 기다리지 않고 빼고 진행
                 note(f"⌛ {label}({failed})가 {judge_timeout}초 안에 답하지 않아 빼고 진행합니다.")
                 board.done(key, r)
                 return r
             if r.get("quota"):
-                wait = COOLDOWN_DAY_SEC if r.get("daily") else COOLDOWN_MIN_SEC
-                cooldowns[failed] = time.time() + wait
-                why = f"사용량 한도 초과 ({wait // 60}분간 자동 제외)"
+                cooldowns[failed] = cooldown_until(failed, r)
+                why = f"사용량 한도 초과 ({clock(cooldowns[failed])}까지 자동 제외)"
+            elif r.get("too_large"):
+                why = "요청이 이 AI의 무료 한도보다 큼"
             else:
                 why = f"오류 ({r['text'][:60]})"
             if not bench(slot, why, key):
                 board.done(key, r)
                 return r
-            r = await ask(label, names[slot], mdl[slot], system, text, imgs, log, timeout=judge_timeout)
+            shrunk = False
+            r = await ask(label, names[slot], mdl[slot], system, make(limit_of(names[slot])), imgs, log,
+                          timeout=judge_timeout)
         board.done(key, r)
         return r
 
@@ -670,7 +718,9 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         log(f"허브 정리 실패 → 원래 질문으로 토론 진행 ({brief_res['text'][:100]})")
 
     # ① 1차 판단
-    jp = judge_prompt(ui, brief)
+    def jp(limit):
+        return judge_prompt(ui, brief, limit)
+
     fa, fb = await asyncio.gather(
         judge_call("a", "판단 A", JUDGE_SYSTEM, jp, "a1"),
         judge_call("b", "판단 B", JUDGE_SYSTEM, jp, "b1"),
@@ -684,8 +734,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     debates = []
     if len(firsts) == 2 and not fast:
         da, db = await asyncio.gather(
-            judge_call("a", "판단 A 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fa, fb), "a2"),
-            judge_call("b", "판단 B 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fb, fa), "b2"),
+            judge_call("a", "판단 A 반론", DEBATE_SYSTEM, lambda n: debate_prompt(ui, brief, fa, fb, n), "a2"),
+            judge_call("b", "판단 B 반론", DEBATE_SYSTEM, lambda n: debate_prompt(ui, brief, fb, fa, n), "b2"),
         )
         debates = [d for d in (da, db) if d["ok"]]
     else:
@@ -705,7 +755,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         if final["ok"]:
             break
         if final.get("quota"):
-            cooldowns[name] = time.time() + (COOLDOWN_DAY_SEC if final.get("daily") else COOLDOWN_MIN_SEC)
+            cooldowns[name] = cooldown_until(name, final)
         note(f"⚠️ 허브 판정({name}) {'사용량 한도 초과' if final.get('quota') else '실패'} → 다른 AI가 판정합니다."
              if i == 0 else f"⚠️ {name} 판정 실패: {final['text'][:80]}")
 
