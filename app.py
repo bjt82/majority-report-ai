@@ -20,11 +20,15 @@ import asyncio
 import base64
 import hmac
 import io
+import json
+import secrets as pysecrets
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import requests
 import streamlit as st
 from anthropic import Anthropic, AsyncAnthropic
 from google import genai
@@ -633,7 +637,99 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
             "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0)}
 
 
-# ───────────────────────── 4) UI ─────────────────────────
+# ───────────────────────── 4) 대화 기록 저장소 ─────────────────────────
+class ConversationStore:
+    """대화 기록 저장소.
+    - GITHUB_TOKEN + DATA_REPO가 있으면: 비공개 GitHub 저장소에 JSON으로 영구 저장 (무료)
+    - 없으면: 앱 서버의 data/ 폴더 (앱이 재시작되면 사라짐)
+    구조: index.json (목록) + conversations/<id>.json (대화 전체)
+    """
+
+    def __init__(self):
+        self.token = secret("GITHUB_TOKEN")
+        self.repo = secret("DATA_REPO")
+        self.remote = bool(self.token and self.repo)
+        self.local_dir = Path(__file__).parent / "data"
+
+    # GitHub Contents API
+    def _url(self, path):
+        return f"https://api.github.com/repos/{self.repo}/contents/{path}"
+
+    def _headers(self, raw=False):
+        return {"Authorization": f"Bearer {self.token}", "X-GitHub-Api-Version": "2022-11-28",
+                "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json"}
+
+    def _read(self, path):
+        if not self.remote:
+            f = self.local_dir / path
+            return json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+        r = requests.get(self._url(path), headers=self._headers(raw=True), timeout=20)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return json.loads(r.text)
+
+    def _sha(self, path):
+        r = requests.get(self._url(path), headers=self._headers(), timeout=20)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json().get("sha")
+
+    def _write(self, path, obj, message):
+        text = json.dumps(obj, ensure_ascii=False, indent=1)
+        if not self.remote:
+            f = self.local_dir / path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text, encoding="utf-8")
+            return
+        for _ in range(2):                       # 동시 수정으로 sha가 어긋나면 한 번 더
+            body = {"message": message, "content": base64.b64encode(text.encode()).decode()}
+            sha = self._sha(path)
+            if sha:
+                body["sha"] = sha
+            r = requests.put(self._url(path), headers=self._headers(), json=body, timeout=30)
+            if r.status_code != 409:
+                r.raise_for_status()
+                return
+        r.raise_for_status()
+
+    def _remove(self, path, message):
+        if not self.remote:
+            (self.local_dir / path).unlink(missing_ok=True)
+            return
+        sha = self._sha(path)
+        if sha:
+            requests.delete(self._url(path), headers=self._headers(),
+                            json={"message": message, "sha": sha}, timeout=30).raise_for_status()
+
+    # 공개 메서드
+    def list(self):
+        idx = self._read("index.json") or {}
+        return sorted(({"id": k, **v} for k, v in idx.items()), key=lambda x: x["updated"], reverse=True)
+
+    def load(self, cid):
+        return self._read(f"conversations/{cid}.json")
+
+    def save(self, conv):
+        self._write(f"conversations/{conv['id']}.json", conv, f"대화 저장: {conv['title']}")
+        idx = self._read("index.json") or {}
+        idx[conv["id"]] = {"title": conv["title"], "created": conv["created"],
+                           "updated": conv["updated"], "turns": len(conv["turns"])}
+        self._write("index.json", idx, f"목록 갱신: {conv['title']}")
+
+    def delete(self, cid):
+        self._remove(f"conversations/{cid}.json", "대화 삭제")
+        idx = self._read("index.json") or {}
+        if idx.pop(cid, None) is not None:
+            self._write("index.json", idx, "목록 갱신: 삭제")
+
+
+def now_text():
+    return datetime.now(ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))).strftime("%Y-%m-%d %H:%M")
+
+
+# ───────────────────────── 5) UI ─────────────────────────
 st.set_page_config(page_title=APP_NAME, page_icon="🔮", layout="wide")
 
 # 공개 URL에서 API 요금 도용을 막는 비밀번호 게이트
@@ -710,12 +806,57 @@ ss.setdefault("conv_docs", "")
 ss.setdefault("conv_images", [])
 ss.setdefault("conv_files", [])
 ss.setdefault("cooldowns", {})    # {AI 이름: 자동 제외 해제 시각}
+ss.setdefault("conv_id", None)    # 저장소에 기록된 현재 대화 id
+ss.setdefault("conv_created", None)
+ss.setdefault("img_count", 0)     # 지난 대화에서 쓴 이미지 수 (이미지는 저장하지 않음)
+store = ConversationStore()
+
+NEW_CONV_KEYS = ("turns", "conv_docs", "conv_images", "conv_files", "conv_id", "conv_created",
+                 "img_count", "history_cache")
+
+
+def reset_conversation():
+    for k in NEW_CONV_KEYS:
+        ss.pop(k, None)
+
+
+def conversation_list(force=False):
+    if force or "history_cache" not in ss:
+        try:
+            ss.history_cache = store.list()
+        except Exception as e:
+            st.sidebar.error(f"대화 기록을 불러오지 못했습니다: {str(e)[:80]}")
+            ss.history_cache = []
+    return ss.history_cache
+
+
+def save_conversation():
+    """현재 대화를 저장소에 기록. 이미지 원본은 용량 때문에 저장하지 않음."""
+    if not ss.conv_id:
+        ss.conv_id = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d-%H%M%S-") + pysecrets.token_hex(2)
+        ss.conv_created = now_text()
+    conv = {"id": ss.conv_id, "title": ss.turns[0]["q"][:40], "created": ss.conv_created,
+            "updated": now_text(), "turns": ss.turns, "docs": ss.conv_docs,
+            "files": ss.conv_files, "images": len(ss.conv_images) + ss.img_count}
+    store.save(conv)
+    ss.pop("history_cache", None)
+
+
+def open_conversation(cid):
+    conv = store.load(cid)
+    if not conv:
+        st.sidebar.error("대화를 찾을 수 없습니다.")
+        return
+    reset_conversation()
+    ss.turns, ss.conv_docs, ss.conv_files = conv["turns"], conv.get("docs", ""), conv.get("files", [])
+    ss.conv_id, ss.conv_created, ss.img_count = conv["id"], conv["created"], conv.get("images", 0)
 
 with st.sidebar:
     st.divider()
-    st.subheader("대화")
-    st.caption(f"현재 {len(ss.turns)}번째 질문까지 진행"
-               + (f" · 첨부 파일 {len(ss.conv_files)}개" if ss.conv_files else ""))
+    st.subheader("현재 대화")
+    st.caption(f"{len(ss.turns)}번째 질문까지 진행"
+               + (f" · 첨부 파일 {len(ss.conv_files)}개" if ss.conv_files else "")
+               + (" · 기록 저장됨" if ss.conv_id else ""))
     for name in ss.conv_files:
         st.caption(f"📎 {name}")
     active = {n: t for n, t in ss.cooldowns.items() if t > time.time()}
@@ -728,8 +869,48 @@ with st.sidebar:
             ss.cooldowns = {}
             st.rerun()
     if st.button("🆕 새 대화 시작", use_container_width=True):
-        for k in ("turns", "conv_docs", "conv_images", "conv_files"):
-            ss.pop(k, None)
+        reset_conversation()
+        st.rerun()
+
+    st.divider()
+    st.subheader("📚 대화 기록")
+    if not store.remote:
+        st.caption("⚠️ 지금은 앱 서버에 임시 저장됩니다. 앱이 재시작되면 사라지니, "
+                   "Secrets에 `GITHUB_TOKEN`과 `DATA_REPO`를 넣어 비공개 GitHub 저장소에 보관하세요.")
+    convs = conversation_list()
+    query = st.text_input("검색", placeholder="질문 내용으로 찾기", label_visibility="collapsed")
+    shown = [c for c in convs if query.strip().lower() in c["title"].lower()] if query.strip() else convs
+    if shown:
+        labels = {c["id"]: f"{c['updated'][5:]} · {c['title']} ({c['turns']}개)" for c in shown}
+        current = ss.conv_id if ss.conv_id in labels else None
+        pick = st.selectbox("지난 대화", list(labels), format_func=labels.get, label_visibility="collapsed",
+                            index=list(labels).index(current) if current else 0)
+        c1, c2 = st.columns(2)
+        if c1.button("📂 열기", use_container_width=True, disabled=pick == ss.conv_id):
+            open_conversation(pick)
+            st.rerun()
+        if c2.button("🗑 삭제", use_container_width=True):
+            ss.confirm_delete = pick
+        if ss.get("confirm_delete") == pick:
+            st.warning(f"'{labels[pick]}' 대화를 지울까요? 되돌릴 수 없습니다.")
+            d1, d2 = st.columns(2)
+            if d1.button("삭제", type="primary", use_container_width=True):
+                try:
+                    store.delete(pick)
+                    if pick == ss.conv_id:
+                        reset_conversation()
+                except Exception as e:
+                    st.error(f"삭제 실패: {str(e)[:80]}")
+                ss.pop("confirm_delete", None)
+                ss.pop("history_cache", None)
+                st.rerun()
+            if d2.button("취소", use_container_width=True):
+                ss.pop("confirm_delete", None)
+                st.rerun()
+    else:
+        st.caption("검색 결과가 없습니다." if query.strip() else "아직 저장된 대화가 없습니다.")
+    if st.button("🔄 기록 새로고침", use_container_width=True):
+        conversation_list(force=True)
         st.rerun()
 
 
@@ -772,6 +953,9 @@ def final_text(res):
 
 
 # 지난 대화 다시 그리기
+if ss.conv_id and ss.img_count and not ss.conv_images:
+    st.info(f"이 대화에서 쓴 이미지 {ss.img_count}장은 기록에 저장되지 않습니다. "
+            "이어서 이미지에 대해 물어보려면 다시 첨부해 주세요. 문서 내용은 그대로 이어집니다.")
 for t in ss.turns:
     with st.chat_message("user"):
         st.markdown(t["q"])
@@ -827,4 +1011,9 @@ if msg and (msg.text.strip() or msg.files):
         if result:
             render_result(result)
             ss.turns.append({"q": question, "files": new_names, "result": result})
+            try:
+                save_conversation()
+            except Exception as e:
+                st.warning(f"대화 기록 저장에 실패했습니다 ({str(e)[:80]}). 답변은 이 화면에 그대로 남습니다.")
+                time.sleep(3)
             st.rerun()
