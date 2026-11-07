@@ -22,6 +22,8 @@ import hmac
 import io
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 from anthropic import Anthropic, AsyncAnthropic
@@ -37,6 +39,8 @@ MAX_DOC_CHARS = 60_000                       # 문서 텍스트 최대 길이(�
 MAX_FILE_MB = 10
 CALL_TIMEOUT_SEC = 180
 RETRY_WAIT_SEC = 20                          # 요청 한도(429)·과부하 시 한 번 재시도 전 대기
+COOLDOWN_MIN_SEC = 10 * 60                   # 분당 한도 초과 시 그 AI를 자동 제외하는 시간
+COOLDOWN_DAY_SEC = 60 * 60                   # 일일 한도 초과로 보일 때 자동 제외하는 시간
 MAX_HISTORY_TURNS = 6                        # 후속 질문 때 함께 보낼 이전 대화 수
 LATEST_ANSWER_CHARS = 12_000                 # 직전 최종안은 거의 전부 전달
 OLDER_ANSWER_CHARS = 3_000                   # 그 이전 최종안은 요약 분량만
@@ -265,9 +269,26 @@ async def call_openai_compat(p, model, system, text, images):
 CALLERS = {"anthropic": call_anthropic, "gemini": call_gemini, "openai": call_openai_compat}
 
 
+QUOTA_WORDS = ("429", "resource_exhausted", "quota", "rate limit", "rate_limit", "ratelimit",
+               "too many requests", "credit balance")
+
+
+def is_quota(msg: str) -> bool:
+    """사용량·요청 한도 초과 여부."""
+    return any(k in msg.lower() for k in QUOTA_WORDS)
+
+
+def is_daily(msg: str) -> bool:
+    """하루 한도 초과로 보이는지 (이 경우 기다려도 소용없으니 재시도하지 않음)."""
+    m = msg.lower().replace("_", "").replace(" ", "")
+    return any(k in m for k in ("perday", "daily", "creditbalance"))
+
+
 def is_retryable(e: Exception) -> bool:
-    msg = f"{type(e).__name__} {e}".lower()
-    return any(k in msg for k in ("429", "rate", "resource_exhausted", "overloaded", "529", "503"))
+    msg = f"{type(e).__name__} {e}"
+    if is_daily(msg):
+        return False
+    return is_quota(msg) or any(k in msg.lower() for k in ("overloaded", "529", "503"))
 
 
 async def ask(role, name, model, system, text, images, log=None):
@@ -291,8 +312,10 @@ async def ask(role, name, model, system, text, images, log=None):
                     log(f"⏳ {name} 요청 한도/과부하 → {RETRY_WAIT_SEC}초 후 재시도")
                 await asyncio.sleep(RETRY_WAIT_SEC)
                 continue
-            return {"role": role, "name": name, "model": model, "ok": False,
-                    "text": f"{type(e).__name__}: {e}", "sec": round(time.perf_counter() - t0, 1)}
+            msg = f"{type(e).__name__}: {e}"
+            return {"role": role, "name": name, "model": model, "ok": False, "text": msg,
+                    "quota": is_quota(msg), "daily": is_daily(msg),
+                    "sec": round(time.perf_counter() - t0, 1)}
 
 
 # ───────────────────────── 프롬프트 ─────────────────────────
@@ -390,9 +413,82 @@ def split_report(text: str):
 
 
 # ───────────────────────── 3) 파이프라인 ─────────────────────────
-async def run_pipeline(ui: UserInput, roles: dict, models: dict, log):
-    hub, a, b = roles["hub"], roles["a"], roles["b"]
+def resolve_model(name: str):
+    """대타로 투입할 AI의 모델: Secrets 기본값, 없으면 목록의 첫 모델."""
+    default = PROVIDERS[name]["model"]
+    if default:
+        return default
+    try:
+        return list_models(name, secret(PROVIDERS[name]["key"]))[0][0]
+    except Exception:
+        return None
+
+
+def clock(ts: float) -> str:
+    """제외 해제 시각을 사용자 시간대(기본 한국)로 표시. 서버는 UTC로 돌기 때문."""
+    return datetime.fromtimestamp(ts, ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))).strftime("%H:%M")
+
+
+def cooled(name: str, cooldowns: dict) -> bool:
+    return cooldowns.get(name, 0) > time.time()
+
+
+async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict):
+    """cooldowns: {AI 이름: 제외 해제 시각}. 사용량 초과가 나면 여기에 기록되어 다음 질문에도 자동 제외."""
+    hub = roles["hub"]
+    names = {"a": roles["a"], "b": roles["b"]}
+    mdl = {"a": models["a"], "b": models["b"]}
+    role_label = {"a": "판단 A", "b": "판단 B"}
     imgs = ui.images
+    notices = []
+
+    def note(msg):
+        notices.append(msg)
+        log(msg)
+
+    def pick_substitute():
+        """두 판단자와 겹치지 않고 제외 중이 아닌 AI. 남는 AI가 먼저, 없으면 허브가 겸함."""
+        busy = set(names.values())
+        spares = [n for n in available_providers() if n not in busy and n != hub]
+        if hub not in busy:
+            spares.append(hub)
+        for n in spares:
+            if not cooled(n, cooldowns) and resolve_model(n):
+                return n
+        return None
+
+    def bench(slot, why):
+        """slot의 판단자를 교체. 성공하면 True."""
+        old = names[slot]
+        sub = pick_substitute()
+        if not sub:
+            note(f"⚠️ {role_label[slot]}({old}) {why} → 대신할 AI가 없어 이 판단자 없이 진행합니다.")
+            return False
+        names[slot], mdl[slot] = sub, resolve_model(sub)
+        who = "허브가 판단자를 겸해 진행합니다" if sub == hub else f"대타: {sub}"
+        note(f"⚠️ {role_label[slot]}({old}) {why} → {who}")
+        return True
+
+    async def judge_call(slot, label, system, text):
+        r = await ask(label, names[slot], mdl[slot], system, text, imgs, log)
+        while not r["ok"]:
+            failed = names[slot]
+            if r.get("quota"):
+                wait = COOLDOWN_DAY_SEC if r.get("daily") else COOLDOWN_MIN_SEC
+                cooldowns[failed] = time.time() + wait
+                why = f"사용량 한도 초과 ({wait // 60}분간 자동 제외)"
+            else:
+                why = f"오류 ({r['text'][:60]})"
+            if not bench(slot, why):
+                return r
+            r = await ask(label, names[slot], mdl[slot], system, text, imgs, log)
+        return r
+
+    # 사용량 초과로 제외 중인 판단자는 시작 전에 미리 교체
+    for slot in ("a", "b"):
+        if cooled(names[slot], cooldowns):
+            until = clock(cooldowns[names[slot]])
+            bench(slot, f"사용량 초과로 {until}까지 제외 중")
 
     # ⓪ 허브의 질문 정리
     log(f"⓪ 허브({hub})가 질문을 정리하는 중")
@@ -402,41 +498,46 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log):
         log(f"허브 정리 실패 → 원래 질문으로 토론 진행 ({brief_res['text'][:100]})")
 
     # ① 1차 판단
-    log(f"① 1차 판단 중: 판단 A({a}) ∥ 판단 B({b})")
+    log(f"① 1차 판단 중: 판단 A({names['a']}) ∥ 판단 B({names['b']})")
     jp = judge_prompt(ui, brief)
     fa, fb = await asyncio.gather(
-        ask("판단 A", a, models["a"], JUDGE_SYSTEM, jp, imgs, log),
-        ask("판단 B", b, models["b"], JUDGE_SYSTEM, jp, imgs, log),
+        judge_call("a", "판단 A", JUDGE_SYSTEM, jp),
+        judge_call("b", "판단 B", JUDGE_SYSTEM, jp),
     )
     firsts = [d for d in (fa, fb) if d["ok"]]
     if not firsts:
-        raise RuntimeError(f"두 판단자 모두 실패했습니다.\n- 판단 A({a}): {fa['text']}\n- 판단 B({b}): {fb['text']}")
+        raise RuntimeError(f"두 판단자 모두 실패했습니다.\n- 판단 A({fa['name']}): {fa['text']}\n"
+                           f"- 판단 B({fb['name']}): {fb['text']}")
 
     # ② 상호 토론
     debates = []
     if len(firsts) == 2:
-        log(f"② 상호 토론 중: A({a}) ⇄ B({b})")
+        log(f"② 상호 토론 중: A({names['a']}) ⇄ B({names['b']})")
         da, db = await asyncio.gather(
-            ask("판단 A 반론", a, models["a"], DEBATE_SYSTEM, debate_prompt(ui, brief, fa, fb), imgs, log),
-            ask("판단 B 반론", b, models["b"], DEBATE_SYSTEM, debate_prompt(ui, brief, fb, fa), imgs, log),
+            judge_call("a", "판단 A 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fa, fb)),
+            judge_call("b", "판단 B 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fb, fa)),
         )
         debates = [d for d in (da, db) if d["ok"]]
     else:
         failed = fa if not fa["ok"] else fb
         log(f"② {failed['role']}({failed['name']})가 실패해 토론을 건너뜁니다.")
 
-    # ③ 최종 판정 (허브 실패 시 살아있는 판단자가 대신)
+    # ③ 최종 판정 (허브 실패 시 판단자가 대신)
     vp = verdict_prompt(ui, brief, firsts, debates)
-    candidates = [("hub", hub)] + [(r, n) for r, n in (("a", a), ("b", b)) if n != hub]
+    candidates = [(hub, models["hub"])] + [(names[k], mdl[k]) for k in ("a", "b") if names[k] != hub]
     final = None
-    for slot, name in candidates:
-        log(f"③ 최종 판정 작성 중 ({'허브' if slot == 'hub' else '대체 판정'}: {name})")
-        final = await ask("최종 판정", name, models[slot], HUB_VERDICT_SYSTEM, vp, imgs, log)
+    for i, (name, model) in enumerate(candidates):
+        log(f"③ 최종 판정 작성 중 ({'허브' if i == 0 else '대체 판정'}: {name})")
+        final = await ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log)
         if final["ok"]:
             break
-        log(f"{name} 판정 실패: {final['text'][:120]}")
+        if final.get("quota"):
+            cooldowns[name] = time.time() + (COOLDOWN_DAY_SEC if final.get("daily") else COOLDOWN_MIN_SEC)
+        note(f"⚠️ 허브 판정({name}) {'사용량 한도 초과' if final.get('quota') else '실패'} → 다른 AI가 판정합니다."
+             if i == 0 else f"⚠️ {name} 판정 실패: {final['text'][:80]}")
 
-    return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final}
+    return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
+            "notices": notices}
 
 
 # ───────────────────────── 4) UI ─────────────────────────
@@ -505,6 +606,7 @@ ss.setdefault("turns", [])        # [{"q", "files", "result"}]
 ss.setdefault("conv_docs", "")
 ss.setdefault("conv_images", [])
 ss.setdefault("conv_files", [])
+ss.setdefault("cooldowns", {})    # {AI 이름: 자동 제외 해제 시각}
 
 with st.sidebar:
     st.divider()
@@ -513,6 +615,15 @@ with st.sidebar:
                + (f" · 첨부 파일 {len(ss.conv_files)}개" if ss.conv_files else ""))
     for name in ss.conv_files:
         st.caption(f"📎 {name}")
+    active = {n: t for n, t in ss.cooldowns.items() if t > time.time()}
+    if active:
+        st.divider()
+        st.subheader("사용량 초과")
+        for n, t in active.items():
+            st.warning(f"⏸ {n}: {clock(t)}까지 자동 제외, 다른 AI가 대신합니다.")
+        if st.button("제외 해제 (지금 다시 시도)", use_container_width=True):
+            ss.cooldowns = {}
+            st.rerun()
     if st.button("🆕 새 대화 시작", use_container_width=True):
         for k in ("turns", "conv_docs", "conv_images", "conv_files"):
             ss.pop(k, None)
@@ -524,6 +635,8 @@ def label(item):
 
 
 def render_result(res):
+    for n in res.get("notices", []):
+        st.warning(n)
     final = res["final"]
     if final and final["ok"]:
         major, minor = split_report(final["text"])
@@ -597,7 +710,7 @@ if msg and (msg.text.strip() or msg.files):
             st.stop()
         with st.status("허브가 토론을 주재하는 중…", expanded=True) as status:
             try:
-                result = asyncio.run(run_pipeline(ui, roles, models, st.write))
+                result = asyncio.run(run_pipeline(ui, roles, models, st.write, ss.cooldowns))
                 status.update(label="판정 완료", state="complete", expanded=False)
             except Exception as e:
                 result = None
