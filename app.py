@@ -39,6 +39,8 @@ MAX_DOC_CHARS = 60_000                       # 문서 텍스트 최대 길이(�
 MAX_FILE_MB = 10
 CALL_TIMEOUT_SEC = 180
 RETRY_WAIT_SEC = 20                          # 요청 한도(429)·과부하 시 한 번 재시도 전 대기
+SEARCH_MAX_USES = 3                          # 허브가 질문 하나에 웹 검색할 수 있는 최대 횟수
+CLAUDE_SEARCH_TOOLS = ("web_search_20260318", "web_search_20250305")   # 최신 → 예전 버전 순으로 시도
 COOLDOWN_MIN_SEC = 10 * 60                   # 분당 한도 초과 시 그 AI를 자동 제외하는 시간
 COOLDOWN_DAY_SEC = 60 * 60                   # 일일 한도 초과로 보일 때 자동 제외하는 시간
 MAX_HISTORY_TURNS = 6                        # 후속 질문 때 함께 보낼 이전 대화 수
@@ -84,6 +86,10 @@ DEFAULT_ROLES = {"hub": ["Claude", "Gemini"],
                  "b": ["Groq", "Mistral", "OpenRouter", "Gemini", "Claude"]}
 GEMINI_EXCLUDE = ("embedding", "tts", "image", "audio", "live", "robotics",
                   "computer-use", "aqa", "cyber", "veo", "imagen", "lyria")
+
+
+def today() -> str:
+    return datetime.now(ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))).strftime("%Y-%m-%d")
 
 
 def available_providers():
@@ -175,7 +181,7 @@ class UserInput:
         )
 
     def base_text(self) -> str:
-        parts = []
+        parts = [f"(오늘 날짜: {today()}. 이 날짜 기준으로 '최근', '현재'를 판단하세요.)"]
         if self.history:
             parts.append(self.history_text())
         if self.doc_text:
@@ -232,31 +238,95 @@ def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-async def call_anthropic(p, model, system, text, images):
+def search_disabled_error(e: Exception) -> bool:
+    """웹 검색 도구가 거부된 오류인지 (조직 설정에서 꺼짐, 도구 버전 미지원 등)."""
+    msg = str(e).lower()
+    return "web_search" in msg or ("tool" in msg and ("not enabled" in msg or "not supported" in msg))
+
+
+async def call_anthropic(p, model, system, text, images, search=False):
+    content = [{"type": "image",
+                "source": {"type": "base64", "media_type": img.mime, "data": b64(img.data)}}
+               for img in images]
+    content.append({"type": "text", "text": text})
+    meta = {"sources": [], "searches": 0, "search_note": ""}
+    versions = list(CLAUDE_SEARCH_TOOLS) if search else []
     async with AsyncAnthropic(api_key=secret(p["key"])) as client:
-        content = [{"type": "image",
-                    "source": {"type": "base64", "media_type": img.mime, "data": b64(img.data)}}
-                   for img in images]
-        content.append({"type": "text", "text": text})
-        resp = await client.messages.create(
-            model=model, max_tokens=8000, system=system,
-            messages=[{"role": "user", "content": content}],
-        )
-        return "".join(b.text for b in resp.content if b.type == "text")
+        while True:
+            tool = versions[0] if versions else None
+            kwargs = {}
+            if tool:
+                kwargs["tools"] = [{"type": tool, "name": "web_search", "max_uses": SEARCH_MAX_USES,
+                                    "allowed_callers": ["direct"],
+                                    "user_location": {"type": "approximate", "country": "KR",
+                                                      "timezone": "Asia/Seoul"}}]
+                if tool == "web_search_20250305":
+                    kwargs["tools"][0].pop("allowed_callers")
+            messages = [{"role": "user", "content": content}]
+            try:
+                blocks = []
+                for _ in range(4):        # 서버 도구가 길어지면 pause_turn으로 끊어 오므로 이어서 요청
+                    resp = await client.messages.create(model=model, max_tokens=8000, system=system,
+                                                        messages=messages, **kwargs)
+                    blocks += resp.content
+                    if resp.stop_reason != "pause_turn":
+                        break
+                    messages = messages + [{"role": "assistant",
+                                            "content": [b.model_dump(exclude_none=True) for b in resp.content]}]
+                break
+            except Exception as e:
+                if tool and search_disabled_error(e):
+                    versions.pop(0)
+                    if not versions:
+                        meta["search_note"] = f"Claude 웹 검색을 쓸 수 없어 검색 없이 진행했습니다 ({str(e)[:80]})"
+                    continue
+                raise
+
+    seen = set()
+    for b in blocks:
+        if b.type == "server_tool_use" and getattr(b, "name", "") == "web_search":
+            meta["searches"] += 1
+        elif b.type == "web_search_tool_result":
+            res = b.content
+            if isinstance(res, list):
+                for r in res:
+                    if r.url not in seen:
+                        seen.add(r.url)
+                        meta["sources"].append({"title": r.title or r.url, "url": r.url})
+            else:
+                meta["search_note"] = f"웹 검색 오류: {getattr(res, 'error_code', res)}"
+    out = "".join(b.text for b in blocks if b.type == "text")
+    return out, meta
 
 
-async def call_gemini(p, model, system, text, images):
+async def call_gemini(p, model, system, text, images, search=False):
     client = genai.Client(api_key=secret(p["key"]))
     parts = [types.Part.from_bytes(data=img.data, mime_type=img.mime) for img in images]
     parts.append(text)
-    resp = await client.aio.models.generate_content(
-        model=model, contents=parts,
-        config=types.GenerateContentConfig(system_instruction=system),
-    )
-    return resp.text or ""
+    meta = {"sources": [], "searches": 0, "search_note": ""}
+    cfg = dict(system_instruction=system)
+    if search:
+        cfg["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+    try:
+        resp = await client.aio.models.generate_content(
+            model=model, contents=parts, config=types.GenerateContentConfig(**cfg))
+    except Exception as e:
+        if not search:
+            raise
+        meta["search_note"] = f"Gemini 검색 연동을 쓸 수 없어 검색 없이 진행했습니다 ({str(e)[:80]})"
+        resp = await client.aio.models.generate_content(
+            model=model, contents=parts, config=types.GenerateContentConfig(system_instruction=system))
+    if search and resp.candidates:
+        gm = resp.candidates[0].grounding_metadata
+        if gm:
+            meta["searches"] = len(gm.web_search_queries or [])
+            for ch in gm.grounding_chunks or []:
+                if ch.web and ch.web.uri:
+                    meta["sources"].append({"title": ch.web.title or ch.web.uri, "url": ch.web.uri})
+    return resp.text or "", meta
 
 
-async def call_openai_compat(p, model, system, text, images):
+async def call_openai_compat(p, model, system, text, images, search=False):
     async with AsyncOpenAI(api_key=secret(p["key"]), base_url=p["base_url"]) as client:
         resp = await client.chat.completions.create(
             model=model, max_tokens=8000,
@@ -291,7 +361,7 @@ def is_retryable(e: Exception) -> bool:
     return is_quota(msg) or any(k in msg.lower() for k in ("overloaded", "529", "503"))
 
 
-async def ask(role, name, model, system, text, images, log=None):
+async def ask(role, name, model, system, text, images, log=None, search=False):
     """예외를 삼키고 결과 dict로 돌려줘서 gather 전체가 깨지지 않게 함. 한도 초과 시 1회 재시도."""
     p = PROVIDERS[name]
     if images and not p["vision"]:
@@ -301,11 +371,17 @@ async def ask(role, name, model, system, text, images, log=None):
     t0 = time.perf_counter()
     for attempt in (1, 2):
         try:
-            out = await asyncio.wait_for(CALLERS[p["kind"]](p, model, system, text, images),
+            kw = {"search": True} if search else {}
+            out = await asyncio.wait_for(CALLERS[p["kind"]](p, model, system, text, images, **kw),
                                          CALL_TIMEOUT_SEC)
+            meta = {}
+            if isinstance(out, tuple):
+                out, meta = out
             ok = bool(out.strip())
             return {"role": role, "name": name, "model": model, "ok": ok,
-                    "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1)}
+                    "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1),
+                    "sources": meta.get("sources", []), "searches": meta.get("searches", 0),
+                    "search_note": meta.get("search_note", "")}
         except Exception as e:
             if attempt == 1 and is_retryable(e):
                 if log:
@@ -326,7 +402,8 @@ HUB_BRIEF_SYSTEM = (
 
 JUDGE_SYSTEM = (
     "당신은 허브 AI가 주재하는 토론의 판단자입니다. 정확하고 근거 있는 답변을 하세요. "
-    "확실하지 않은 내용은 추측이라고 명시하고, 사용자의 질문과 같은 언어로 답하세요."
+    "확실하지 않은 내용은 추측이라고 명시하고, 사용자의 질문과 같은 언어로 답하세요. "
+    "허브의 브리프에 웹 검색으로 확인한 '최신 근거'가 있으면, 당신의 학습 시점 지식보다 그 근거를 우선하세요."
 )
 
 DEBATE_SYSTEM = (
@@ -342,7 +419,11 @@ HUB_VERDICT_SYSTEM = (
 )
 
 
-def brief_prompt(ui: UserInput) -> str:
+def brief_prompt(ui: UserInput, search: bool = False) -> str:
+    search_part = ("\n6. 최신 근거: 답이 최신 정보(현재 가격·제도·일정·인물·출시 여부·최근 사건 등)에 좌우되면 "
+                   "웹 검색으로 확인하고, 확인한 사실을 날짜와 출처 URL과 함께 적으세요. "
+                   "검색이 필요 없는 질문이면 검색하지 말고 \"검색 불필요\"라고만 쓰세요."
+                   if search else "")
     return f"""{ui.base_text()}
 
 두 판단자가 토론할 수 있도록 아래 형식으로 질문을 정리하세요. 결론은 내리지 마세요.
@@ -350,7 +431,7 @@ def brief_prompt(ui: UserInput) -> str:
 2. 이전 대화와의 연결: 직전 최종안에서 이어지는 맥락과, 그 결론 중 이번 질문으로 다시 따져야 할 부분 (이전 대화가 없으면 "없음")
 3. 따져야 할 쟁점: 답에 영향을 주는 판단 포인트 2~5개
 4. 첨부 자료 요약: 문서의 핵심 근거와, 이미지가 있다면 이미지에 보이는 내용을 판단자가 볼 수 없어도 이해할 만큼 구체적으로 (없으면 "없음")
-5. 좋은 답의 조건: 답변 범위, 형식, 피해야 할 것"""
+5. 좋은 답의 조건: 답변 범위, 형식, 피해야 할 것{search_part}"""
 
 
 def judge_prompt(ui: UserInput, brief: str) -> str:
@@ -379,10 +460,15 @@ def debate_prompt(ui: UserInput, brief: str, own: dict, other: dict) -> str:
 4. 수정된 최종 입장: 위를 반영한 나의 최종 답 요약 (5~10줄)"""
 
 
-def verdict_prompt(ui: UserInput, brief: str, firsts: list, debates: list) -> str:
+def verdict_prompt(ui: UserInput, brief: str, firsts: list, debates: list, sources=()) -> str:
     blocks = [ui.base_text()]
     if brief:
         blocks.append(f"<brief>\n{brief}\n</brief>")
+    if sources:
+        listing = "\n".join(f"- [{s['title']}]({s['url']})" for s in sources)
+        blocks.append(f"<search_sources>\n{listing}\n</search_sources>\n"
+                      "(허브가 웹 검색으로 확인한 출처입니다. 최종 결론에서 최신 사실을 말할 때는 해당 출처를 "
+                      "[제목](URL) 링크로 붙이세요. 이 목록에 없는 URL은 만들지 마세요.)")
     for d in firsts:
         blocks.append(f'<first_answer judge="{d["role"]}">\n{d["text"]}\n</first_answer>')
     for d in debates:
@@ -433,7 +519,7 @@ def cooled(name: str, cooldowns: dict) -> bool:
     return cooldowns.get(name, 0) > time.time()
 
 
-async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict):
+async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict, search=False):
     """cooldowns: {AI 이름: 제외 해제 시각}. 사용량 초과가 나면 여기에 기록되어 다음 질문에도 자동 제외."""
     hub = roles["hub"]
     names = {"a": roles["a"], "b": roles["b"]}
@@ -491,9 +577,16 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
             bench(slot, f"사용량 초과로 {until}까지 제외 중")
 
     # ⓪ 허브의 질문 정리
-    log(f"⓪ 허브({hub})가 질문을 정리하는 중")
-    brief_res = await ask("허브 정리", hub, models["hub"], HUB_BRIEF_SYSTEM, brief_prompt(ui), imgs, log)
+    search = search and PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
+    log(f"⓪ 허브({hub})가 질문을 정리하는 중" + (" (필요하면 웹 검색)" if search else ""))
+    brief_res = await ask("허브 정리", hub, models["hub"], HUB_BRIEF_SYSTEM, brief_prompt(ui, search),
+                          imgs, log, search=search)
     brief = brief_res["text"] if brief_res["ok"] else ""
+    sources = brief_res.get("sources", [])
+    if brief_res.get("search_note"):
+        note(f"🔎 {brief_res['search_note']}")
+    if brief_res.get("searches"):
+        log(f"🔎 웹 검색 {brief_res['searches']}회, 출처 {len(sources)}개 확인")
     if not brief:
         log(f"허브 정리 실패 → 원래 질문으로 토론 진행 ({brief_res['text'][:100]})")
 
@@ -523,7 +616,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         log(f"② {failed['role']}({failed['name']})가 실패해 토론을 건너뜁니다.")
 
     # ③ 최종 판정 (허브 실패 시 판단자가 대신)
-    vp = verdict_prompt(ui, brief, firsts, debates)
+    vp = verdict_prompt(ui, brief, firsts, debates, sources)
     candidates = [(hub, models["hub"])] + [(names[k], mdl[k]) for k in ("a", "b") if names[k] != hub]
     final = None
     for i, (name, model) in enumerate(candidates):
@@ -537,7 +630,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
              if i == 0 else f"⚠️ {name} 판정 실패: {final['text'][:80]}")
 
     return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
-            "notices": notices}
+            "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0)}
 
 
 # ───────────────────────── 4) UI ─────────────────────────
@@ -581,6 +674,16 @@ with st.sidebar:
                      index=b_pool.index(pick_default("b", b_pool, taken=(a,))))
     if hub in (a, b):
         st.caption("ℹ️ 키가 2개뿐이라 허브가 판단자를 겸합니다. 무료 API 키를 하나 더 넣으면 역할이 분리됩니다.")
+
+    can_search = PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
+    web_search = st.toggle("🔎 웹 검색 (허브가 최신 정보 확인)", value=can_search and bool(secret("WEB_SEARCH", True)),
+                           disabled=not can_search)
+    if not can_search:
+        st.caption(f"{hub}는 웹 검색을 지원하지 않습니다. 허브를 Claude나 Gemini로 바꾸면 쓸 수 있어요.")
+    elif hub == "Claude":
+        st.caption(f"필요할 때만 질문당 최대 {SEARCH_MAX_USES}회 검색 · 검색 1,000회당 10달러가 Team 크레딧에서 차감")
+    else:
+        st.caption("Google 검색 연동 · 무료 등급에서 막히면 검색 없이 진행합니다")
 
     with st.expander("모델 선택"):
         models = {
@@ -642,7 +745,12 @@ def render_result(res):
         major, minor = split_report(final["text"])
         st.markdown("##### 📜 Majority Report")
         st.markdown(major)
-        st.caption(f"최종 판정: {final['name']} · {final['sec']}초")
+        st.caption(f"최종 판정: {final['name']} · {final['sec']}초"
+                   + (f" · 웹 검색 {res['searches']}회" if res.get("searches") else ""))
+        if res.get("sources"):
+            with st.expander(f"🔎 허브가 확인한 출처 ({len(res['sources'])}개)"):
+                for src in res["sources"]:
+                    st.markdown(f"- [{src['title']}]({src['url']})")
         if minor:
             with st.container(border=True):
                 st.markdown("**🔍 Minority Report** — 토론의 쟁점과 판정 근거")
@@ -710,7 +818,7 @@ if msg and (msg.text.strip() or msg.files):
             st.stop()
         with st.status("허브가 토론을 주재하는 중…", expanded=True) as status:
             try:
-                result = asyncio.run(run_pipeline(ui, roles, models, st.write, ss.cooldowns))
+                result = asyncio.run(run_pipeline(ui, roles, models, st.write, ss.cooldowns, web_search))
                 status.update(label="판정 완료", state="complete", expanded=False)
             except Exception as e:
                 result = None
