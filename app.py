@@ -26,6 +26,7 @@ import secrets as pysecrets
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -42,7 +43,9 @@ APP_NAME = "Majority Report AI"
 MINORITY_MARKER = "<<<MINORITY_REPORT>>>"   # 최종 결론과 소수 의견을 나누는 구분자
 MAX_DOC_CHARS = 60_000                       # 문서 텍스트 최대 길이(토큰 비용 보호)
 MAX_FILE_MB = 10
-CALL_TIMEOUT_SEC = 180
+CALL_TIMEOUT_SEC = 180                       # 허브 정리·최종 판정 한 번의 최대 대기
+JUDGE_TIMEOUT_DEFAULT = 90                   # 판단자 한 단계의 기본 시간 제한 (화면에서 변경)
+RUNTIME = {"gemini_thinking": "low"}         # 화면 설정을 호출부에 전달 (Gemini 생각 수준)
 RETRY_WAIT_SEC = 20                          # 요청 한도(429)·과부하 시 한 번 재시도 전 대기
 SEARCH_MAX_USES = 3                          # 허브가 질문 하나에 웹 검색할 수 있는 최대 횟수
 CLAUDE_SEARCH_TOOLS = ("web_search_20260318", "web_search_20250305")   # 최신 → 예전 버전 순으로 시도
@@ -249,11 +252,20 @@ def search_disabled_error(e: Exception) -> bool:
     return "web_search" in msg or ("tool" in msg and ("not enabled" in msg or "not supported" in msg))
 
 
-async def call_anthropic(p, model, system, text, images, search=False):
+async def call_anthropic(p, model, system, text, images, search=False, on_text=None):
     content = [{"type": "image",
                 "source": {"type": "base64", "media_type": img.mime, "data": b64(img.data)}}
                for img in images]
     content.append({"type": "text", "text": text})
+    if on_text and not search:            # 최종 판정: 글자가 나오는 대로 화면에 표시
+        async with AsyncAnthropic(api_key=secret(p["key"])) as client:
+            async with client.messages.stream(model=model, max_tokens=8000, system=system,
+                                              messages=[{"role": "user", "content": content}]) as stream:
+                out = []
+                async for chunk in stream.text_stream:
+                    out.append(chunk)
+                    on_text(chunk)
+                return "".join(out)
     meta = {"sources": [], "searches": 0, "search_note": ""}
     versions = list(CLAUDE_SEARCH_TOOLS) if search else []
     async with AsyncAnthropic(api_key=secret(p["key"])) as client:
@@ -304,24 +316,48 @@ async def call_anthropic(p, model, system, text, images, search=False):
     return out, meta
 
 
-async def call_gemini(p, model, system, text, images, search=False):
+async def call_gemini(p, model, system, text, images, search=False, on_text=None):
     client = genai.Client(api_key=secret(p["key"]))
     parts = [types.Part.from_bytes(data=img.data, mime_type=img.mime) for img in images]
     parts.append(text)
     meta = {"sources": [], "searches": 0, "search_note": ""}
-    cfg = dict(system_instruction=system)
-    if search:
-        cfg["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-    try:
-        resp = await client.aio.models.generate_content(
-            model=model, contents=parts, config=types.GenerateContentConfig(**cfg))
-    except Exception as e:
-        if not search:
+    level = RUNTIME.get("gemini_thinking")
+
+    def config(with_search, with_thinking):
+        cfg = dict(system_instruction=system)
+        if with_search:
+            cfg["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+        if with_thinking and level:
+            cfg["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+        return types.GenerateContentConfig(**cfg)
+
+    async def run(cfg):
+        if on_text:
+            out = []
+            async for chunk in await client.aio.models.generate_content_stream(
+                    model=model, contents=parts, config=cfg):
+                if chunk.text:
+                    out.append(chunk.text)
+                    on_text(chunk.text)
+            return SimpleNamespace(text="".join(out), candidates=None)
+        return await client.aio.models.generate_content(model=model, contents=parts, config=cfg)
+
+    use_search, use_thinking = search, True
+    while True:
+        try:
+            resp = await run(config(use_search, use_thinking))
+            break
+        except Exception as e:
+            msg = str(e).lower()
+            if use_thinking and level and "thinking" in msg:      # 생각 수준을 지원하지 않는 모델
+                use_thinking = False
+                continue
+            if use_search:
+                meta["search_note"] = f"Gemini 검색 연동을 쓸 수 없어 검색 없이 진행했습니다 ({str(e)[:80]})"
+                use_search = False
+                continue
             raise
-        meta["search_note"] = f"Gemini 검색 연동을 쓸 수 없어 검색 없이 진행했습니다 ({str(e)[:80]})"
-        resp = await client.aio.models.generate_content(
-            model=model, contents=parts, config=types.GenerateContentConfig(system_instruction=system))
-    if search and resp.candidates:
+    if use_search and resp.candidates:
         gm = resp.candidates[0].grounding_metadata
         if gm:
             meta["searches"] = len(gm.web_search_queries or [])
@@ -331,8 +367,19 @@ async def call_gemini(p, model, system, text, images, search=False):
     return resp.text or "", meta
 
 
-async def call_openai_compat(p, model, system, text, images, search=False):
+async def call_openai_compat(p, model, system, text, images, search=False, on_text=None):
     async with AsyncOpenAI(api_key=secret(p["key"]), base_url=p["base_url"]) as client:
+        if on_text:
+            stream = await client.chat.completions.create(
+                model=model, max_tokens=8000, stream=True,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": text}])
+            out = []
+            async for ev in stream:
+                piece = ev.choices[0].delta.content if ev.choices else None
+                if piece:
+                    out.append(piece)
+                    on_text(piece)
+            return "".join(out)
         resp = await client.chat.completions.create(
             model=model, max_tokens=8000,
             messages=[{"role": "system", "content": system},
@@ -366,7 +413,8 @@ def is_retryable(e: Exception) -> bool:
     return is_quota(msg) or any(k in msg.lower() for k in ("overloaded", "529", "503"))
 
 
-async def ask(role, name, model, system, text, images, log=None, search=False):
+async def ask(role, name, model, system, text, images, log=None, search=False,
+              timeout=CALL_TIMEOUT_SEC, on_text=None):
     """예외를 삼키고 결과 dict로 돌려줘서 gather 전체가 깨지지 않게 함. 한도 초과 시 1회 재시도."""
     p = PROVIDERS[name]
     if images and not p["vision"]:
@@ -377,8 +425,10 @@ async def ask(role, name, model, system, text, images, log=None, search=False):
     for attempt in (1, 2):
         try:
             kw = {"search": True} if search else {}
-            out = await asyncio.wait_for(CALLERS[p["kind"]](p, model, system, text, images, **kw),
-                                         CALL_TIMEOUT_SEC)
+            if on_text:
+                on_text(None)                 # 재시도면 화면에 쓰던 글을 비움
+                kw["on_text"] = on_text
+            out = await asyncio.wait_for(CALLERS[p["kind"]](p, model, system, text, images, **kw), timeout)
             meta = {}
             if isinstance(out, tuple):
                 out, meta = out
@@ -387,6 +437,9 @@ async def ask(role, name, model, system, text, images, log=None, search=False):
                     "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1),
                     "sources": meta.get("sources", []), "searches": meta.get("searches", 0),
                     "search_note": meta.get("search_note", "")}
+        except (asyncio.TimeoutError, TimeoutError):
+            return {"role": role, "name": name, "model": model, "ok": False, "timeout": True,
+                    "text": f"{timeout}초 안에 응답하지 않았습니다.", "sec": round(time.perf_counter() - t0, 1)}
         except Exception as e:
             if attempt == 1 and is_retryable(e):
                 if log:
@@ -526,13 +579,14 @@ def cooled(name: str, cooldowns: dict) -> bool:
 
 class NullBoard:
     """진행판이 없을 때(테스트 등) 쓰는 빈 진행판."""
+    stream = None
     def start(self, *a, **k): pass
     def done(self, *a, **k): pass
     def skip(self, *a, **k): pass
 
 
 async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict, search=False,
-                       board=None, fast=False):
+                       board=None, fast=False, judge_timeout=JUDGE_TIMEOUT_DEFAULT):
     """cooldowns: {AI 이름: 제외 해제 시각}. 사용량 초과가 나면 여기에 기록되어 다음 질문에도 자동 제외.
     board: 단계별 진행 상황을 그리는 진행판. fast: 상호 토론(②)을 건너뛰는 빠른 모드."""
     board = board or NullBoard()
@@ -574,9 +628,13 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     async def judge_call(slot, label, system, text, key):
         board.start(key, names[slot])
-        r = await ask(label, names[slot], mdl[slot], system, text, imgs, log)
+        r = await ask(label, names[slot], mdl[slot], system, text, imgs, log, timeout=judge_timeout)
         while not r["ok"]:
             failed = names[slot]
+            if r.get("timeout"):              # 느린 판단자는 기다리지 않고 빼고 진행
+                note(f"⌛ {label}({failed})가 {judge_timeout}초 안에 답하지 않아 빼고 진행합니다.")
+                board.done(key, r)
+                return r
             if r.get("quota"):
                 wait = COOLDOWN_DAY_SEC if r.get("daily") else COOLDOWN_MIN_SEC
                 cooldowns[failed] = time.time() + wait
@@ -586,7 +644,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
             if not bench(slot, why, key):
                 board.done(key, r)
                 return r
-            r = await ask(label, names[slot], mdl[slot], system, text, imgs, log)
+            r = await ask(label, names[slot], mdl[slot], system, text, imgs, log, timeout=judge_timeout)
         board.done(key, r)
         return r
 
@@ -641,7 +699,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     final = None
     for i, (name, model) in enumerate(candidates):
         board.start("verdict", name, "" if i == 0 else "허브 대신 판정")
-        final = await ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log)
+        final = await ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log,
+                          on_text=getattr(board, "stream", None))
         board.done("verdict", final)
         if final["ok"]:
             break
@@ -812,6 +871,22 @@ class ProgressBoard:
     def note(self, msg):
         self.notes.caption(msg)
 
+    live = None          # 최종 판정을 실시간으로 그릴 자리 (진행판 바깥, 답변 위치)
+
+    def stream(self, chunk):
+        """최종 판정 글자를 받는 대로 표시. chunk=None이면 새로 시작(재시도)."""
+        if chunk is None:
+            self.streamed, self.last_draw = "", 0.0
+            if self.status is not None:
+                self.status.update(expanded=False)       # 진행판을 접고 답에 집중
+            return
+        self.streamed += chunk
+        now = time.time()
+        if self.live is not None and now - self.last_draw > 0.12:
+            self.last_draw = now
+            major = self.streamed.split(MINORITY_MARKER, 1)[0]
+            self.live.markdown("##### 📜 Majority Report · 작성 중\n\n" + major + " ▌")
+
     def render(self):
         now = time.time()
         lines, finished, running = [], 0, []
@@ -932,6 +1007,15 @@ with st.sidebar:
         fast = st.toggle("⚡ 빠른 모드 (토론 생략)", value=False, key="r_fast",
                          help="② 상호 토론을 건너뛰어 호출이 6회에서 4회로 줄고 더 빨리 끝납니다. "
                               "대신 서로의 오류를 바로잡는 과정이 빠집니다.")
+        t1, t2 = st.columns(2)
+        judge_timeout = t1.selectbox("판단 시간 제한", [60, 90, 120, 180],
+                                     index=[60, 90, 120, 180].index(JUDGE_TIMEOUT_DEFAULT),
+                                     format_func=lambda v: f"{v}초", key="r_timeout",
+                                     help="판단자가 이 시간 안에 답하지 않으면 기다리지 않고 빼고 진행합니다.")
+        levels = {"low": "낮음 (빠름)", "minimal": "최소", "medium": "보통", "high": "높음 (느림)", "": "모델 기본값"}
+        RUNTIME["gemini_thinking"] = t2.selectbox(
+            "Gemini 생각", list(levels), format_func=levels.get, key="r_think",
+            help="Gemini가 답하기 전에 생각하는 정도입니다. 낮을수록 빠르고, 높을수록 꼼꼼하지만 느립니다.") or None
         pick_models = st.checkbox("모델 직접 고르기", key="r_pick",
                                   help="끄면 Secrets에 지정한 기본 모델을 씁니다.")
         if pick_models:
@@ -1091,14 +1175,17 @@ if msg and (msg.text.strip() or msg.files):
         if None in models.values():
             st.error("모델이 선택되지 않은 역할이 있습니다. 사이드바의 모델 선택을 확인하세요.")
             st.stop()
-        with st.status("허브가 토론을 주재하는 중…", expanded=True) as status:
+        status = st.status("허브가 토론을 주재하는 중…", expanded=True)
+        with status:
             board = ProgressBoard(roles, status)
+        board.live = st.empty()           # 최종 판정이 실시간으로 나타날 자리
+        with status:
 
             async def run_with_board():
                 ticker = asyncio.create_task(board.tick())
                 try:
                     return await run_pipeline(ui, roles, models, board.note, ss.cooldowns, web_search,
-                                              board=board, fast=fast)
+                                              board=board, fast=fast, judge_timeout=judge_timeout)
                 finally:
                     board.running = False
                     await ticker
@@ -1106,6 +1193,7 @@ if msg and (msg.text.strip() or msg.files):
             try:
                 result = asyncio.run(run_with_board())
                 board.render()
+                board.live.empty()            # 실시간 초안을 지우고 완성본으로 다시 그림
                 status.update(label=f"판정 완료 · {time.time() - board.t0:.0f}초", state="complete",
                               expanded=False)
             except Exception as e:
