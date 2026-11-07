@@ -29,6 +29,8 @@ MAX_DOC_CHARS = 60_000                       # 문서 텍스트 최대 길이(�
 MAX_FILE_MB = 10
 CALL_TIMEOUT_SEC = 180
 RETRY_WAIT_SEC = 20                          # 요청 한도(429)·과부하 시 한 번 재시도 전 대기
+MAX_HISTORY_TURNS = 6                        # 후속 질문 때 함께 보낼 이전 대화 수
+MAX_HISTORY_ANSWER_CHARS = 4_000             # 이전 답변 하나당 보낼 최대 글자 수
 IMAGE_MIME = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "webp": "image/webp", "gif": "image/gif",
@@ -116,9 +118,21 @@ class UserInput:
     prompt: str
     doc_text: str = ""
     images: list = field(default_factory=list)
+    history: list = field(default_factory=list)   # [(이전 질문, 이전 최종 답변), ...]
 
     def base_text(self) -> str:
         parts = []
+        if self.history:
+            turns = []
+            for i, (q, a) in enumerate(self.history[-MAX_HISTORY_TURNS:], 1):
+                if len(a) > MAX_HISTORY_ANSWER_CHARS:
+                    a = a[:MAX_HISTORY_ANSWER_CHARS] + " …(이하 생략)"
+                turns.append(f"[{i}] 사용자: {q}\n[{i}] 최종 답변: {a}")
+            parts.append(
+                "<conversation_history>\n" + "\n\n".join(turns) + "\n</conversation_history>\n"
+                "(위는 이 사용자와의 이전 대화입니다. 아래 질문은 이 대화의 후속 질문일 수 있으니 "
+                "맥락을 이어서 답하세요.)"
+            )
         if self.doc_text:
             parts.append(
                 "<documents>\n" + self.doc_text + "\n</documents>\n"
@@ -366,33 +380,33 @@ with st.sidebar:
     st.caption("요청 1회 = API 호출 5회\n(초안 2 + 교차 검토 2 + 합의 1)")
 
 st.title(f"🔮 {APP_NAME}")
-st.caption("Claude와 Gemini가 각자 답하고, 서로 검토하고, 하나의 답으로 합의합니다.")
-prompt = st.text_area("질문", height=140, placeholder="무엇이든 물어보세요. 문서나 이미지를 함께 올릴 수 있습니다.")
-files = st.file_uploader("파일 첨부 (PDF, TXT, MD, 이미지)",
-                         type=["pdf", "txt", "md", *IMAGE_MIME.keys()], accept_multiple_files=True)
+st.caption("Claude와 Gemini가 각자 답하고, 서로 검토하고, 하나의 답으로 합의합니다. 후속 질문으로 대화를 이어갈 수 있어요.")
 
-if st.button("실행", type="primary", disabled=not prompt.strip()):
-    doc_text, images, warns = process_uploads(files)
-    for w in warns:
-        st.warning(w)
-    ui = UserInput(prompt=prompt.strip(), doc_text=doc_text, images=images)
+# 대화 상태: 턴 기록 + 이 대화에 첨부된 파일(후속 질문에서도 계속 참고)
+ss = st.session_state
+ss.setdefault("turns", [])        # [{"q", "files", "result"}]
+ss.setdefault("conv_docs", "")
+ss.setdefault("conv_images", [])
+ss.setdefault("conv_files", [])
 
-    with st.status("Claude와 Gemini가 심의 중…", expanded=True) as status:
-        try:
-            result = asyncio.run(run_pipeline(ui, judge, models, st.write))
-            st.session_state.result = result
-            status.update(label="완료", state="complete", expanded=False)
-        except Exception as e:
-            st.session_state.pop("result", None)
-            status.update(label="실패", state="error")
-            st.error(str(e))
+with st.sidebar:
+    st.divider()
+    st.subheader("대화")
+    st.caption(f"현재 {len(ss.turns)}번째 질문까지 진행"
+               + (f" · 첨부 파일 {len(ss.conv_files)}개" if ss.conv_files else ""))
+    for name in ss.conv_files:
+        st.caption(f"📎 {name}")
+    if st.button("🆕 새 대화 시작", use_container_width=True):
+        for k in ("turns", "conv_docs", "conv_images", "conv_files"):
+            ss.pop(k, None)
+        st.rerun()
 
-res = st.session_state.get("result")
-if res:
+
+def render_result(res):
     final = res["final"]
-    st.subheader("📜 Majority Report")
     if final and final["ok"]:
         major, minor = split_report(final["text"])
+        st.markdown("##### 📜 Majority Report")
         st.markdown(major)
         st.caption(f"최종 합의: {final['name']} · {final['sec']}초")
         if minor:
@@ -401,12 +415,71 @@ if res:
                 st.markdown(minor)
     else:
         st.error(f"최종 합의 단계 실패: {final['text'] if final else '알 수 없는 오류'}")
+    with st.expander("심의 과정 보기 (초안 2 · 교차 검토 2)"):
+        tabs = st.tabs([f"초안 · {d['name']}{'' if d['ok'] else ' ❌'}" for d in res["drafts"]]
+                       + [f"검토 · {r['name']}" for r in res["reviews"]])
+        for tab, item in zip(tabs, res["drafts"] + res["reviews"]):
+            with tab:
+                st.caption(f"{item['sec']}초")
+                st.markdown(item["text"])
 
-    st.divider()
-    col1, col2 = st.columns(2)
-    for col, d in zip((col1, col2), res["drafts"]):
-        with col, st.expander(f"초안 · {d['name']} ({d['sec']}초){'' if d['ok'] else ' ❌'}"):
-            st.markdown(d["text"])
-    for r in res["reviews"]:
-        with st.expander(f"교차 검토 · {r['name']}의 의견 ({r['sec']}초)"):
-            st.markdown(r["text"])
+
+def final_text(res):
+    f = res["final"]
+    return split_report(f["text"])[0] if f and f["ok"] else ""
+
+
+# 지난 대화 다시 그리기
+for t in ss.turns:
+    with st.chat_message("user"):
+        st.markdown(t["q"])
+        for name in t["files"]:
+            st.caption(f"📎 {name}")
+    with st.chat_message("assistant", avatar="🔮"):
+        render_result(t["result"])
+
+msg = st.chat_input(
+    "질문을 입력하세요. 이전 답변에 대한 후속 질문도 됩니다. (📎로 PDF·TXT·MD·이미지 첨부)",
+    accept_file="multiple", file_type=["pdf", "txt", "md", *IMAGE_MIME.keys()],
+)
+
+if msg and (msg.text.strip() or msg.files):
+    question = msg.text.strip() or "첨부한 파일의 내용을 정리해 주세요."
+    new_names = [f.name for f in msg.files]
+
+    with st.chat_message("user"):
+        st.markdown(question)
+        for name in new_names:
+            st.caption(f"📎 {name}")
+
+    # 새 첨부를 대화 전체 첨부에 누적
+    doc_text, images, warns = process_uploads(msg.files)
+    if doc_text:
+        merged = (ss.conv_docs + "\n\n" + doc_text).strip()
+        if len(merged) > MAX_DOC_CHARS:
+            merged = merged[-MAX_DOC_CHARS:]
+            warns.append(f"대화에 첨부된 문서가 길어 최근 {MAX_DOC_CHARS:,}자만 사용합니다.")
+        ss.conv_docs = merged
+    ss.conv_images += images
+    ss.conv_files += [n for n in new_names if n not in ss.conv_files]
+
+    ui = UserInput(
+        prompt=question, doc_text=ss.conv_docs, images=ss.conv_images,
+        history=[(t["q"], final_text(t["result"])) for t in ss.turns],
+    )
+
+    with st.chat_message("assistant", avatar="🔮"):
+        for w in warns:
+            st.warning(w)
+        with st.status("Claude와 Gemini가 심의 중…", expanded=True) as status:
+            try:
+                result = asyncio.run(run_pipeline(ui, judge, models, st.write))
+                status.update(label="심의 완료", state="complete", expanded=False)
+            except Exception as e:
+                result = None
+                status.update(label="실패", state="error")
+                st.error(str(e))
+        if result:
+            render_result(result)
+            ss.turns.append({"q": question, "files": new_names, "result": result})
+            st.rerun()
