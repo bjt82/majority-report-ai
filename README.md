@@ -1,22 +1,29 @@
 # 🔮 Majority Report AI
 
-Claude와 Gemini가 각자 답하고, 서로 검토하고, 하나의 답으로 합의하는 상호 검토형 AI 허브입니다.
+허브 AI가 질문을 정리하면 두 AI가 토론하고, 허브가 최종 결론을 판정하는 상호 검토형 AI 허브입니다.
 
 ## 작동 방식
-1. **병렬 초안**: Claude와 Gemini가 같은 질문에 독립적으로 동시에 답합니다.
-2. **교차 검토**: Claude는 Gemini의 답을, Gemini는 Claude의 답을 동시에 검토해 오류·누락·장점을 찾습니다.
-3. **최종 합의**: 사이드바에서 고른 심판 모델(Claude 또는 Gemini)이 초안과 검토를 종합해 **Majority Report**(최종 답변)와 **Minority Report**(이견·교정 내역)를 냅니다.
+질문 1회에 API 호출 6회가 일어나며, 허브는 그중 2회만 사용합니다.
 
-텍스트 질문과 함께 PDF, TXT, MD 문서와 이미지(PNG, JPG, WEBP, GIF)를 첨부할 수 있습니다.
+0. **질문 정리**: 허브 AI(기본 Claude)가 질문·첨부 파일·직전 최종안을 분석해 쟁점을 정리합니다.
+1. **1차 판단**: 판단 A(기본 Gemini)와 판단 B(기본 Groq의 gpt-oss-120b)가 정리된 질문에 독립적으로 동시에 답합니다.
+2. **상호 토론**: A는 B의 답을, B는 A의 답을 반박하거나 인정하며 자기 입장을 고칩니다.
+3. **최종 판정**: 허브가 토론 전체를 보고 **Majority Report**(최종 결론)와 **Minority Report**(쟁점·판정 근거)를 냅니다.
 
-## 실행
-```bash
-pip install -r requirements.txt
-mkdir -p .streamlit && cp secrets.toml.example .streamlit/secrets.toml   # 실제 키로 수정
-streamlit run app.py
-```
+후속 질문은 직전 **최종 판정**을 출발점으로 이어지며, 결론이 바뀌면 무엇이 왜 바뀌었는지 밝힙니다.
+대화 중 첨부한 PDF·TXT·MD·이미지는 같은 대화 안에서 계속 참고됩니다.
 
-## 배포
-Streamlit Community Cloud에서 이 저장소를 연결하고, Settings → Secrets에 `secrets.toml.example` 형식으로 키를 입력합니다.
+## 지원 AI
+| AI | Secrets 키 | 비고 |
+|---|---|---|
+| Claude | `ANTHROPIC_API_KEY` | 허브 권장 (Team 요금제 API 크레딧) |
+| Gemini | `GEMINI_API_KEY` | 무료 등급 |
+| Groq | `GROQ_API_KEY` | 무료 등급, 학습에 사용 안 함 |
+| Mistral | `MISTRAL_API_KEY` | 무료 Experiment 플랜 |
+| OpenRouter | `OPENROUTER_API_KEY` | `:free` 모델만 표시 |
 
-> ⚠️ API 키는 절대 커밋하지 마세요. 요청 1회당 API 호출이 5회 발생하므로 `APP_PASSWORD`를 꼭 설정하세요.
+키가 있는 AI만 화면에 나타나고, 모델 목록은 각 API에서 자동으로 불러옵니다.
+설정 예시는 `secrets.toml.example`을 참고하세요.
+
+> ⚠️ API 키는 절대 커밋하지 마세요. `APP_PASSWORD`를 꼭 설정하세요.
+> 일부 무료 API는 입력 내용을 학습에 사용할 수 있으니 개인정보가 담긴 파일은 올리지 마세요.
