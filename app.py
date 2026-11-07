@@ -1,12 +1,11 @@
 """
-Majority Report AI — 상호 검토형 통합 AI 허브
+Majority Report AI — Claude × Gemini 상호 검토형 AI 허브
 
-파이프라인
-  1) 입력 처리   : 텍스트 + PDF/TXT(텍스트 추출) + 이미지(멀티모달 전달)
-  2) 병렬 초안   : 모델 A, B에 asyncio.gather로 동시 질의
-  3) 교차 검토   : A가 B를, B가 A를 동시에 검토 (자기 수정점 포함)
-  4) 최종 통합   : 심판(Judge) 모델이 초안 2 + 검토 2를 종합해
-                   Majority Report(합의된 답) + Minority Report(이견·교정 내역) 생성
+파이프라인 (요청 1회 = API 호출 5회)
+  ① 병렬 초안   : Claude ∥ Gemini 가 같은 질문에 독립적으로 동시 답변
+  ② 교차 검토   : Claude는 Gemini의 답을, Gemini는 Claude의 답을 동시 검토 (자기 수정 포함)
+  ③ 최종 합의   : 심판 모델이 초안 2 + 검토 2를 종합해
+                   Majority Report(합의된 답) + Minority Report(이견·교정 내역) 작성
 
 실행: streamlit run app.py
 """
@@ -21,15 +20,15 @@ import streamlit as st
 from anthropic import AsyncAnthropic
 from google import genai
 from google.genai import types
-from openai import AsyncOpenAI
 from pypdf import PdfReader
 
 # ───────────────────────── 설정 ─────────────────────────
 APP_NAME = "Majority Report AI"
 MINORITY_MARKER = "<<<MINORITY_REPORT>>>"   # 합의 답변과 소수 의견을 나누는 구분자
-MAX_DOC_CHARS = 60_000          # 문서 텍스트 최대 길이(토큰 비용 보호)
+MAX_DOC_CHARS = 60_000                       # 문서 텍스트 최대 길이(토큰 비용 보호)
 MAX_FILE_MB = 10
 CALL_TIMEOUT_SEC = 180
+RETRY_WAIT_SEC = 20                          # 요청 한도(429)·과부하 시 한 번 재시도 전 대기
 IMAGE_MIME = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "webp": "image/webp", "gif": "image/gif",
@@ -44,12 +43,13 @@ def secret(key: str, default=None):
         return default
 
 
-# 모델 ID는 자주 바뀌므로 Secrets에서 덮어쓸 수 있게 함
+CLAUDE, GEMINI = "Claude", "Gemini"
 DEFAULT_MODELS = {
-    "GPT": secret("OPENAI_MODEL", "gpt-5"),
-    "Claude": secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
-    "Gemini": secret("GEMINI_MODEL", "gemini-2.5-flash"),
+    CLAUDE: secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
+    GEMINI: secret("GEMINI_MODEL", "gemini-3.8-flash"),
 }
+KEY_NAMES = {CLAUDE: "ANTHROPIC_API_KEY", GEMINI: "GEMINI_API_KEY"}
+
 
 # ───────────────────────── 데이터 구조 ─────────────────────────
 @dataclass
@@ -115,29 +115,12 @@ def process_uploads(files):
     return doc, images, warnings
 
 
-# ───────────────────────── 2) 공급자별 비동기 호출 ─────────────────────────
-def b64(data: bytes) -> str:
-    return base64.b64encode(data).decode()
-
-
-async def call_gpt(model, system, text, images):
-    async with AsyncOpenAI(api_key=secret("OPENAI_API_KEY")) as client:
-        content = [{"type": "text", "text": text}]
-        for img in images:
-            content.append({"type": "image_url",
-                            "image_url": {"url": f"data:{img.mime};base64,{b64(img.data)}"}})
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": content}],
-        )
-        return resp.choices[0].message.content or ""
-
-
+# ───────────────────────── 2) 모델별 비동기 호출 ─────────────────────────
 async def call_claude(model, system, text, images):
     async with AsyncAnthropic(api_key=secret("ANTHROPIC_API_KEY")) as client:
         content = [{"type": "image",
-                    "source": {"type": "base64", "media_type": img.mime, "data": b64(img.data)}}
+                    "source": {"type": "base64", "media_type": img.mime,
+                               "data": base64.b64encode(img.data).decode()}}
                    for img in images]
         content.append({"type": "text", "text": text})
         resp = await client.messages.create(
@@ -158,21 +141,31 @@ async def call_gemini(model, system, text, images):
     return resp.text or ""
 
 
-PROVIDERS = {"GPT": call_gpt, "Claude": call_claude, "Gemini": call_gemini}
-KEY_NAMES = {"GPT": "OPENAI_API_KEY", "Claude": "ANTHROPIC_API_KEY", "Gemini": "GEMINI_API_KEY"}
+PROVIDERS = {CLAUDE: call_claude, GEMINI: call_gemini}
 
 
-async def ask(name, model, system, text, images):
-    """예외를 삼키고 결과 dict로 돌려줘서 gather 전체가 깨지지 않게 함."""
+def is_retryable(e: Exception) -> bool:
+    msg = f"{type(e).__name__} {e}".lower()
+    return any(k in msg for k in ("429", "rate", "resource_exhausted", "overloaded", "529", "503"))
+
+
+async def ask(name, model, system, text, images, log=None):
+    """예외를 삼키고 결과 dict로 돌려줘서 gather 전체가 깨지지 않게 함. 한도 초과 시 1회 재시도."""
     t0 = time.perf_counter()
-    try:
-        out = await asyncio.wait_for(PROVIDERS[name](model, system, text, images), CALL_TIMEOUT_SEC)
-        ok = bool(out.strip())
-        return {"name": name, "ok": ok, "text": out if ok else "빈 응답",
-                "sec": round(time.perf_counter() - t0, 1)}
-    except Exception as e:
-        return {"name": name, "ok": False, "text": f"{type(e).__name__}: {e}",
-                "sec": round(time.perf_counter() - t0, 1)}
+    for attempt in (1, 2):
+        try:
+            out = await asyncio.wait_for(PROVIDERS[name](model, system, text, images), CALL_TIMEOUT_SEC)
+            ok = bool(out.strip())
+            return {"name": name, "ok": ok, "text": out if ok else "빈 응답",
+                    "sec": round(time.perf_counter() - t0, 1)}
+        except Exception as e:
+            if attempt == 1 and is_retryable(e):
+                if log:
+                    log(f"⏳ {name} 요청 한도/과부하 → {RETRY_WAIT_SEC}초 후 재시도")
+                await asyncio.sleep(RETRY_WAIT_SEC)
+                continue
+            return {"name": name, "ok": False, "text": f"{type(e).__name__}: {e}",
+                    "sec": round(time.perf_counter() - t0, 1)}
 
 
 # ───────────────────────── 프롬프트 ─────────────────────────
@@ -187,7 +180,8 @@ REVIEW_SYSTEM = (
 )
 
 SYNTH_SYSTEM = (
-    "당신은 최종 편집자입니다. 여러 AI의 초안과 상호 검토 의견을 받아 하나의 최종 답변을 작성합니다. "
+    "당신은 최종 편집자입니다. 두 AI의 초안과 상호 검토 의견을 받아 하나의 최종 답변을 작성합니다. "
+    "당신 자신의 초안도 포함되어 있지만 특별 대우하지 말고 두 초안을 동등하게 평가하세요. "
     "검토에서 지적된 오류는 실제로 오류인지 스스로 판단한 뒤 반영하고, 의견이 갈리면 더 근거가 탄탄한 쪽을 택하되 "
     "확정할 수 없으면 불확실하다고 밝히세요. 사용자의 질문과 같은 언어로 답하세요."
 )
@@ -223,7 +217,7 @@ def synth_prompt(ui: UserInput, drafts: list, reviews: list) -> str:
     blocks.append(
         "최종 답변을 작성하세요. 먼저 사용자에게 보여줄 완성된 답변(Majority Report)을 쓰세요.\n"
         f"그다음 새 줄에 정확히 {MINORITY_MARKER} 라고만 쓰고, 그 아래에 Minority Report를 작성하세요.\n"
-        "- 모델 간 의견이 갈렸던 지점과, 채택하지 않은 소수 의견 및 그 이유\n"
+        "- 두 모델의 의견이 갈렸던 지점과, 채택하지 않은 소수 의견 및 그 이유\n"
         "- 초안에서 바로잡은 주요 오류\n"
         "- 여전히 확정할 수 없는 부분\n"
         "의견이 갈린 지점이 없으면 '이견 없음'이라고만 쓰세요. 전체 3~6줄로 간결하게."
@@ -240,13 +234,14 @@ def split_report(text: str):
 
 
 # ───────────────────────── 3) 파이프라인 ─────────────────────────
-async def run_pipeline(ui: UserInput, a: str, b: str, judge: str, models: dict, log):
+async def run_pipeline(ui: UserInput, judge: str, models: dict, log):
+    a, b = CLAUDE, GEMINI
     imgs = ui.images
 
     log(f"① 병렬 초안 생성 중: {a} ∥ {b}")
     da, db = await asyncio.gather(
-        ask(a, models[a], DRAFT_SYSTEM, ui.base_text(), imgs),
-        ask(b, models[b], DRAFT_SYSTEM, ui.base_text(), imgs),
+        ask(a, models[a], DRAFT_SYSTEM, ui.base_text(), imgs, log),
+        ask(b, models[b], DRAFT_SYSTEM, ui.base_text(), imgs, log),
     )
     drafts = [d for d in (da, db) if d["ok"]]
     if not drafts:
@@ -256,20 +251,26 @@ async def run_pipeline(ui: UserInput, a: str, b: str, judge: str, models: dict, 
     if len(drafts) == 2:
         log(f"② 상호 교차 검토 중: {a}→{b} ∥ {b}→{a}")
         ra, rb = await asyncio.gather(
-            ask(a, models[a], REVIEW_SYSTEM, review_prompt(ui, own=da, other=db), imgs),
-            ask(b, models[b], REVIEW_SYSTEM, review_prompt(ui, own=db, other=da), imgs),
+            ask(a, models[a], REVIEW_SYSTEM, review_prompt(ui, own=da, other=db), imgs, log),
+            ask(b, models[b], REVIEW_SYSTEM, review_prompt(ui, own=db, other=da), imgs, log),
         )
         reviews = [r for r in (ra, rb) if r["ok"]]
     else:
-        log("② 한쪽 초안이 실패해 교차 검토를 건너뜁니다.")
+        failed = da if not da["ok"] else db
+        log(f"② {failed['name']} 초안이 실패해 교차 검토를 건너뜁니다.")
 
-    log(f"③ 최종 통합 중 (심판: {judge})")
-    final = await ask(judge, models[judge], SYNTH_SYSTEM, synth_prompt(ui, drafts, reviews), imgs)
-    if not final["ok"]:
-        # 심판 실패 시 초안 모델 중 하나로 재시도
-        fallback = drafts[0]["name"]
-        log(f"심판 실패 → {fallback}(으)로 재시도")
-        final = await ask(fallback, models[fallback], SYNTH_SYSTEM, synth_prompt(ui, drafts, reviews), imgs)
+    # 심판이 실패했거나 초안을 못 냈다면, 살아있는 모델이 통합을 맡음
+    alive = [d["name"] for d in drafts]
+    order = [judge] + [m for m in (a, b) if m != judge]
+    order = [m for m in order if m in alive] + [m for m in order if m not in alive]
+
+    final = None
+    for m in order:
+        log(f"③ 최종 합의 작성 중 (심판: {m})")
+        final = await ask(m, models[m], SYNTH_SYSTEM, synth_prompt(ui, drafts, reviews), imgs, log)
+        if final["ok"]:
+            break
+        log(f"심판 {m} 실패: {final['text'][:120]}")
 
     return {"drafts": [da, db], "reviews": reviews, "final": final}
 
@@ -291,20 +292,19 @@ if app_pw and not st.session_state.get("authed"):
 
 with st.sidebar:
     st.header("모델 구성")
-    available = [n for n in PROVIDERS if secret(KEY_NAMES[n])]
-    if len(available) < 2:
-        st.error("API 키가 2개 이상 필요합니다. Secrets 설정을 확인하세요.")
+    missing = [n for n in PROVIDERS if not secret(KEY_NAMES[n])]
+    if missing:
+        st.error("Secrets에 다음 키가 없습니다:\n\n" + "\n".join(f"- `{KEY_NAMES[n]}`" for n in missing))
         st.stop()
-    model_a = st.selectbox("초안 모델 A", available, index=0)
-    model_b = st.selectbox("초안 모델 B", [m for m in available if m != model_a])
-    judge_default = next((m for m in available if m not in (model_a, model_b)), model_a)
-    judge = st.selectbox("통합 심판 모델", available, index=available.index(judge_default))
+    st.markdown(f"**초안·검토:** {CLAUDE} × {GEMINI}")
+    judge = st.radio("최종 합의 심판", [CLAUDE, GEMINI], index=0, horizontal=True,
+                     help="두 초안과 상호 검토를 종합해 최종 답을 쓰는 모델입니다.")
     with st.expander("모델 ID 직접 지정"):
         models = {n: st.text_input(n, DEFAULT_MODELS[n]) for n in PROVIDERS}
-    st.caption("요청 1회 = API 호출 5회 (초안 2 + 검토 2 + 통합 1)")
+    st.caption("요청 1회 = API 호출 5회\n(초안 2 + 교차 검토 2 + 합의 1)")
 
 st.title(f"🔮 {APP_NAME}")
-st.caption("두 AI가 각자 답하고, 서로 검토하고, 하나의 답으로 합의합니다.")
+st.caption("Claude와 Gemini가 각자 답하고, 서로 검토하고, 하나의 답으로 합의합니다.")
 prompt = st.text_area("질문", height=140, placeholder="무엇이든 물어보세요. 문서나 이미지를 함께 올릴 수 있습니다.")
 files = st.file_uploader("파일 첨부 (PDF, TXT, MD, 이미지)",
                          type=["pdf", "txt", "md", *IMAGE_MIME.keys()], accept_multiple_files=True)
@@ -315,9 +315,9 @@ if st.button("실행", type="primary", disabled=not prompt.strip()):
         st.warning(w)
     ui = UserInput(prompt=prompt.strip(), doc_text=doc_text, images=images)
 
-    with st.status("AI들이 심의 중…", expanded=True) as status:
+    with st.status("Claude와 Gemini가 심의 중…", expanded=True) as status:
         try:
-            result = asyncio.run(run_pipeline(ui, model_a, model_b, judge, models, st.write))
+            result = asyncio.run(run_pipeline(ui, judge, models, st.write))
             st.session_state.result = result
             status.update(label="완료", state="complete", expanded=False)
         except Exception as e:
@@ -329,16 +329,16 @@ res = st.session_state.get("result")
 if res:
     final = res["final"]
     st.subheader("📜 Majority Report")
-    if final["ok"]:
+    if final and final["ok"]:
         major, minor = split_report(final["text"])
         st.markdown(major)
-        st.caption(f"통합: {final['name']} · {final['sec']}초")
+        st.caption(f"최종 합의: {final['name']} · {final['sec']}초")
         if minor:
             with st.container(border=True):
                 st.markdown("**🔍 Minority Report** — 의견이 갈렸거나 바로잡은 지점")
                 st.markdown(minor)
     else:
-        st.error(f"통합 단계 실패: {final['text']}")
+        st.error(f"최종 합의 단계 실패: {final['text'] if final else '알 수 없는 오류'}")
 
     st.divider()
     col1, col2 = st.columns(2)
