@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 
 import streamlit as st
-from anthropic import AsyncAnthropic
+from anthropic import Anthropic, AsyncAnthropic
 from google import genai
 from google.genai import types
 from pypdf import PdfReader
@@ -49,6 +49,59 @@ DEFAULT_MODELS = {
     GEMINI: secret("GEMINI_MODEL", "gemini-3.8-flash"),
 }
 KEY_NAMES = {CLAUDE: "ANTHROPIC_API_KEY", GEMINI: "GEMINI_API_KEY"}
+
+
+# ───────────────────────── 모델 목록 자동 조회 ─────────────────────────
+# Gemini 목록에서 텍스트 대화용이 아닌 모델(임베딩·음성·이미지 생성 등)을 거름
+GEMINI_EXCLUDE = ("embedding", "tts", "image", "audio", "live", "robotics",
+                  "computer-use", "aqa", "cyber", "veo", "imagen", "lyria")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_claude_models(api_key: str):
+    """Anthropic Models API에서 사용 가능한 모델을 최신순으로 가져옴."""
+    client = Anthropic(api_key=api_key)
+    return [(m.id, m.display_name) for m in client.models.list(limit=100)]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_gemini_models(api_key: str):
+    """Gemini Models API에서 텍스트 생성이 가능한 gemini 모델만 가져옴."""
+    client = genai.Client(api_key=api_key)
+    out = []
+    for m in client.models.list():
+        mid = (m.name or "").removeprefix("models/")
+        actions = m.supported_actions or []
+        if not mid.startswith("gemini") or "generateContent" not in actions:
+            continue
+        if any(k in mid for k in GEMINI_EXCLUDE):
+            continue
+        out.append((mid, m.display_name or mid))
+    return sorted(out, key=lambda x: x[0], reverse=True)
+
+
+def model_picker(label: str, provider: str, key_name: str, lister):
+    """API로 목록을 불러와 드롭다운 표시. 실패하면 기본값 하나만 보여줌."""
+    default = DEFAULT_MODELS[provider]
+    try:
+        options = lister(secret(key_name))
+        err = None
+    except Exception as e:
+        options, err = [], f"{type(e).__name__}: {e}"
+    if not options:
+        options = [(default, default)]
+    ids = [i for i, _ in options]
+    if default not in ids:            # Secrets에 지정한 기본값을 항상 선택지에 포함
+        options.insert(0, (default, default))
+        ids.insert(0, default)
+    names = dict(options)
+    choice = st.selectbox(
+        label, ids, index=ids.index(default),
+        format_func=lambda i: i if names[i] == i else f"{names[i]}  ·  {i}",
+    )
+    if err:
+        st.caption(f"⚠️ 목록 조회 실패, 기본값 사용 ({err[:80]})")
+    return choice
 
 
 # ───────────────────────── 데이터 구조 ─────────────────────────
@@ -299,8 +352,17 @@ with st.sidebar:
     st.markdown(f"**초안·검토:** {CLAUDE} × {GEMINI}")
     judge = st.radio("최종 합의 심판", [CLAUDE, GEMINI], index=0, horizontal=True,
                      help="두 초안과 상호 검토를 종합해 최종 답을 쓰는 모델입니다.")
-    with st.expander("모델 ID 직접 지정"):
-        models = {n: st.text_input(n, DEFAULT_MODELS[n]) for n in PROVIDERS}
+    st.subheader("모델 선택")
+    models = {
+        CLAUDE: model_picker("Claude 모델", CLAUDE, KEY_NAMES[CLAUDE], list_claude_models),
+        GEMINI: model_picker("Gemini 모델", GEMINI, KEY_NAMES[GEMINI], list_gemini_models),
+    }
+    st.caption("목록은 각 API에서 1시간마다 자동으로 새로 불러옵니다. "
+               "Gemini는 유료 전용 모델도 목록에 보일 수 있으니, 무료 등급에서 오류가 나면 Flash 계열을 고르세요.")
+    if st.button("🔄 모델 목록 새로고침"):
+        list_claude_models.clear()
+        list_gemini_models.clear()
+        st.rerun()
     st.caption("요청 1회 = API 호출 5회\n(초안 2 + 교차 검토 2 + 합의 1)")
 
 st.title(f"🔮 {APP_NAME}")
