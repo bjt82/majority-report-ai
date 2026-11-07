@@ -21,6 +21,7 @@ import base64
 import hmac
 import io
 import json
+import re
 import secrets as pysecrets
 import time
 from pathlib import Path
@@ -523,8 +524,18 @@ def cooled(name: str, cooldowns: dict) -> bool:
     return cooldowns.get(name, 0) > time.time()
 
 
-async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict, search=False):
-    """cooldowns: {AI 이름: 제외 해제 시각}. 사용량 초과가 나면 여기에 기록되어 다음 질문에도 자동 제외."""
+class NullBoard:
+    """진행판이 없을 때(테스트 등) 쓰는 빈 진행판."""
+    def start(self, *a, **k): pass
+    def done(self, *a, **k): pass
+    def skip(self, *a, **k): pass
+
+
+async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict, search=False,
+                       board=None, fast=False):
+    """cooldowns: {AI 이름: 제외 해제 시각}. 사용량 초과가 나면 여기에 기록되어 다음 질문에도 자동 제외.
+    board: 단계별 진행 상황을 그리는 진행판. fast: 상호 토론(②)을 건너뛰는 빠른 모드."""
+    board = board or NullBoard()
     hub = roles["hub"]
     names = {"a": roles["a"], "b": roles["b"]}
     mdl = {"a": models["a"], "b": models["b"]}
@@ -547,7 +558,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
                 return n
         return None
 
-    def bench(slot, why):
+    def bench(slot, why, key=None):
         """slot의 판단자를 교체. 성공하면 True."""
         old = names[slot]
         sub = pick_substitute()
@@ -555,11 +566,14 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
             note(f"⚠️ {role_label[slot]}({old}) {why} → 대신할 AI가 없어 이 판단자 없이 진행합니다.")
             return False
         names[slot], mdl[slot] = sub, resolve_model(sub)
+        if key:
+            board.start(key, sub, f"{old} 대신 투입")
         who = "허브가 판단자를 겸해 진행합니다" if sub == hub else f"대타: {sub}"
         note(f"⚠️ {role_label[slot]}({old}) {why} → {who}")
         return True
 
-    async def judge_call(slot, label, system, text):
+    async def judge_call(slot, label, system, text, key):
+        board.start(key, names[slot])
         r = await ask(label, names[slot], mdl[slot], system, text, imgs, log)
         while not r["ok"]:
             failed = names[slot]
@@ -569,9 +583,11 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
                 why = f"사용량 한도 초과 ({wait // 60}분간 자동 제외)"
             else:
                 why = f"오류 ({r['text'][:60]})"
-            if not bench(slot, why):
+            if not bench(slot, why, key):
+                board.done(key, r)
                 return r
             r = await ask(label, names[slot], mdl[slot], system, text, imgs, log)
+        board.done(key, r)
         return r
 
     # 사용량 초과로 제외 중인 판단자는 시작 전에 미리 교체
@@ -582,9 +598,10 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     # ⓪ 허브의 질문 정리
     search = search and PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
-    log(f"⓪ 허브({hub})가 질문을 정리하는 중" + (" (필요하면 웹 검색)" if search else ""))
+    board.start("brief", hub, "필요하면 웹 검색" if search else "")
     brief_res = await ask("허브 정리", hub, models["hub"], HUB_BRIEF_SYSTEM, brief_prompt(ui, search),
                           imgs, log, search=search)
+    board.done("brief", brief_res)
     brief = brief_res["text"] if brief_res["ok"] else ""
     sources = brief_res.get("sources", [])
     if brief_res.get("search_note"):
@@ -595,11 +612,10 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         log(f"허브 정리 실패 → 원래 질문으로 토론 진행 ({brief_res['text'][:100]})")
 
     # ① 1차 판단
-    log(f"① 1차 판단 중: 판단 A({names['a']}) ∥ 판단 B({names['b']})")
     jp = judge_prompt(ui, brief)
     fa, fb = await asyncio.gather(
-        judge_call("a", "판단 A", JUDGE_SYSTEM, jp),
-        judge_call("b", "판단 B", JUDGE_SYSTEM, jp),
+        judge_call("a", "판단 A", JUDGE_SYSTEM, jp, "a1"),
+        judge_call("b", "판단 B", JUDGE_SYSTEM, jp, "b1"),
     )
     firsts = [d for d in (fa, fb) if d["ok"]]
     if not firsts:
@@ -608,24 +624,25 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     # ② 상호 토론
     debates = []
-    if len(firsts) == 2:
-        log(f"② 상호 토론 중: A({names['a']}) ⇄ B({names['b']})")
+    if len(firsts) == 2 and not fast:
         da, db = await asyncio.gather(
-            judge_call("a", "판단 A 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fa, fb)),
-            judge_call("b", "판단 B 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fb, fa)),
+            judge_call("a", "판단 A 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fa, fb), "a2"),
+            judge_call("b", "판단 B 반론", DEBATE_SYSTEM, debate_prompt(ui, brief, fb, fa), "b2"),
         )
         debates = [d for d in (da, db) if d["ok"]]
     else:
-        failed = fa if not fa["ok"] else fb
-        log(f"② {failed['role']}({failed['name']})가 실패해 토론을 건너뜁니다.")
+        why = "빠른 모드" if fast else "판단자 한쪽 실패"
+        board.skip("a2", why)
+        board.skip("b2", why)
 
     # ③ 최종 판정 (허브 실패 시 판단자가 대신)
     vp = verdict_prompt(ui, brief, firsts, debates, sources)
     candidates = [(hub, models["hub"])] + [(names[k], mdl[k]) for k in ("a", "b") if names[k] != hub]
     final = None
     for i, (name, model) in enumerate(candidates):
-        log(f"③ 최종 판정 작성 중 ({'허브' if i == 0 else '대체 판정'}: {name})")
+        board.start("verdict", name, "" if i == 0 else "허브 대신 판정")
         final = await ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log)
+        board.done("verdict", final)
         if final["ok"]:
             break
         if final.get("quota"):
@@ -634,7 +651,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
              if i == 0 else f"⚠️ {name} 판정 실패: {final['text'][:80]}")
 
     return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
-            "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0)}
+            "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0),
+            "fast": fast}
 
 
 # ───────────────────────── 4) 대화 기록 저장소 ─────────────────────────
@@ -752,54 +770,83 @@ def pick_default(role: str, avail: list, taken=()):
     return next((n for n in avail if n not in taken), avail[0])
 
 
-with st.sidebar:
-    st.header("역할 구성")
-    avail = available_providers()
-    if len(avail) < 2:
-        st.error("API 키가 2개 이상 필요합니다. Secrets에 다음 중 두 개 이상을 넣어 주세요:\n\n"
-                 + "\n".join(f"- `{p['key']}`" for p in PROVIDERS.values()))
-        st.stop()
+class ProgressBoard:
+    """토론 진행판: 단계별로 누가 무엇을 하는지, 얼마나 걸리는지 1초마다 갱신."""
+    STEPS = [("brief", "⓪ 질문 정리"), ("a1", "① 1차 판단 A"), ("b1", "① 1차 판단 B"),
+             ("a2", "② 반론 A"), ("b2", "② 반론 B"), ("verdict", "③ 최종 판정")]
+    ICON = {"wait": "⬜", "run": "⏳", "ok": "✅", "fail": "❌", "skip": "⏭️"}
 
-    hub = st.selectbox("🔮 허브 AI (질문 정리·최종 판정)", avail,
-                       index=avail.index(pick_default("hub", avail)))
-    judge_pool = [n for n in avail if n != hub] if len(avail) >= 3 else avail
-    a = st.selectbox("⚖️ 판단 A", judge_pool,
-                     index=judge_pool.index(pick_default("a", judge_pool)))
-    b_pool = [n for n in judge_pool if n != a] or judge_pool
-    b = st.selectbox("⚖️ 판단 B", b_pool,
-                     index=b_pool.index(pick_default("b", b_pool, taken=(a,))))
-    if hub in (a, b):
-        st.caption("ℹ️ 키가 2개뿐이라 허브가 판단자를 겸합니다. 무료 API 키를 하나 더 넣으면 역할이 분리됩니다.")
+    def __init__(self, roles, status):
+        self.t0 = time.time()
+        self.status = status
+        who = {"brief": roles["hub"], "a1": roles["a"], "b1": roles["b"],
+               "a2": roles["a"], "b2": roles["b"], "verdict": roles["hub"]}
+        self.rows = {k: {"state": "wait", "name": who[k], "extra": "", "t": 0, "sec": 0, "preview": ""}
+                     for k, _ in self.STEPS}
+        self.bar = st.progress(0.0, text="시작하는 중…")
+        self.box = st.empty()
+        self.notes = st.container()
+        self.running = True
 
-    can_search = PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
-    web_search = st.toggle("🔎 웹 검색 (허브가 최신 정보 확인)", value=can_search and bool(secret("WEB_SEARCH", True)),
-                           disabled=not can_search)
-    if not can_search:
-        st.caption(f"{hub}는 웹 검색을 지원하지 않습니다. 허브를 Claude나 Gemini로 바꾸면 쓸 수 있어요.")
-    elif hub == "Claude":
-        st.caption(f"필요할 때만 질문당 최대 {SEARCH_MAX_USES}회 검색 · 검색 1,000회당 10달러가 Team 크레딧에서 차감")
-    else:
-        st.caption("Google 검색 연동 · 무료 등급에서 막히면 검색 없이 진행합니다")
+    def start(self, key, name, extra=""):
+        self.rows[key].update(state="run", name=name, extra=extra, t=time.time())
+        self.render()
 
-    with st.expander("모델 선택"):
-        models = {
-            "hub": model_picker(f"허브 · {hub}", hub, "m_hub"),
-            "a": model_picker(f"판단 A · {a}", a, "m_a"),
-            "b": model_picker(f"판단 B · {b}", b, "m_b"),
-        }
-        st.caption("목록은 각 API에서 1시간마다 새로 불러옵니다. 무료 등급에서 오류가 나면 다른 모델을 고르세요.")
-        if st.button("🔄 모델 목록 새로고침"):
-            list_models.clear()
-            st.rerun()
-    st.caption(f"질문 1회 = API 호출 6회\n(허브 {hub} 2회 · 판단 A·B 각 2회)")
+    def done(self, key, res):
+        row = self.rows[key]
+        row.update(state="ok" if res["ok"] else "fail", sec=res["sec"])
+        if res["ok"]:
+            clean = (re.sub(r"[*_`#>|]", "", l).strip(" -") for l in res["text"].splitlines())
+            line = next((l for l in clean if l), "")
+            row["preview"] = line[:70] + ("…" if len(line) > 70 else "")
+            if res.get("searches"):
+                row["extra"] = f"웹 검색 {res['searches']}회 · 출처 {len(res.get('sources', []))}개"
+        else:
+            row["preview"] = res["text"][:70]
+        self.render()
 
-roles = {"hub": hub, "a": a, "b": b}
+    def skip(self, key, why):
+        self.rows[key].update(state="skip", extra=why)
+        self.render()
 
-st.title(f"🔮 {APP_NAME}")
-st.caption("허브 AI가 질문을 정리하면 두 AI가 토론하고, 허브가 최종 결론을 판정합니다. "
-           "후속 질문은 직전 최종안을 기준으로 이어집니다.")
+    def note(self, msg):
+        self.notes.caption(msg)
 
-# 대화 상태: 턴 기록 + 이 대화에 첨부된 파일(후속 질문에서도 계속 참고)
+    def render(self):
+        now = time.time()
+        lines, finished, running = [], 0, []
+        for key, label in self.STEPS:
+            r = self.rows[key]
+            if r["state"] == "run":
+                status = f"{now - r['t']:.0f}초째 진행 중"
+                running.append(label)
+            elif r["state"] in ("ok", "fail"):
+                status = f"{r['sec']}초"
+                finished += 1
+            elif r["state"] == "skip":
+                status = "건너뜀"
+                finished += 1
+            else:
+                status = "대기"
+            extra = f" · {r['extra']}" if r["extra"] else ""
+            line = f"{self.ICON[r['state']]} **{label}** · {r['name']} — {status}{extra}"
+            if r["preview"]:
+                line += f"  \n&nbsp;&nbsp;&nbsp;&nbsp;_{r['preview']}_"
+            lines.append(line)
+        elapsed = f"전체 {now - self.t0:.0f}초"
+        stage = " · ".join(running) if running else ("판정 완료" if finished == len(self.STEPS) else "준비 중")
+        self.bar.progress(min(finished / len(self.STEPS), 1.0), text=f"{stage} · {elapsed}")
+        self.box.markdown("  \n".join(lines))
+        if self.status is not None:
+            self.status.update(label=f"{stage} · {elapsed}")
+
+    async def tick(self):
+        while self.running:
+            self.render()
+            await asyncio.sleep(1)
+
+
+# 세션 상태 (사이드바보다 먼저 준비)
 ss = st.session_state
 ss.setdefault("turns", [])        # [{"q", "files", "result"}]
 ss.setdefault("conv_docs", "")
@@ -851,48 +898,89 @@ def open_conversation(cid):
     ss.turns, ss.conv_docs, ss.conv_files = conv["turns"], conv.get("docs", ""), conv.get("files", [])
     ss.conv_id, ss.conv_created, ss.img_count = conv["id"], conv["created"], conv.get("images", 0)
 
+
 with st.sidebar:
-    st.divider()
-    st.subheader("현재 대화")
-    st.caption(f"{len(ss.turns)}번째 질문까지 진행"
-               + (f" · 첨부 파일 {len(ss.conv_files)}개" if ss.conv_files else "")
-               + (" · 기록 저장됨" if ss.conv_id else ""))
-    for name in ss.conv_files:
-        st.caption(f"📎 {name}")
-    active = {n: t for n, t in ss.cooldowns.items() if t > time.time()}
-    if active:
-        st.divider()
-        st.subheader("사용량 초과")
-        for n, t in active.items():
-            st.warning(f"⏸ {n}: {clock(t)}까지 자동 제외, 다른 AI가 대신합니다.")
-        if st.button("제외 해제 (지금 다시 시도)", use_container_width=True):
-            ss.cooldowns = {}
-            st.rerun()
-    if st.button("🆕 새 대화 시작", use_container_width=True):
+    avail = available_providers()
+    if len(avail) < 2:
+        st.error("API 키가 2개 이상 필요합니다. Secrets에 다음 중 두 개 이상을 넣어 주세요:\n\n"
+                 + "\n".join(f"- `{p['key']}`" for p in PROVIDERS.values()))
+        st.stop()
+
+    if st.button("🆕 새 대화", type="primary", use_container_width=True):
         reset_conversation()
         st.rerun()
+    if ss.turns:
+        st.caption(f"현재 대화: 질문 {len(ss.turns)}개"
+                   + (f" · 📎 {len(ss.conv_files)}개" if ss.conv_files else "")
+                   + (" · 저장됨" if ss.conv_id else ""))
+
+    # 역할 구성: 한 줄 요약 + 접힌 설정
+    summary = st.empty()
+    with st.expander("⚙️ 역할·모델 설정"):
+        hub = st.selectbox("허브 (정리·판정)", avail, index=avail.index(pick_default("hub", avail)), key="r_hub")
+        judge_pool = [n for n in avail if n != hub] if len(avail) >= 3 else avail
+        c1, c2 = st.columns(2)
+        a = c1.selectbox("판단 A", judge_pool, index=judge_pool.index(pick_default("a", judge_pool)), key="r_a")
+        b_pool = [n for n in judge_pool if n != a] or judge_pool
+        b = c2.selectbox("판단 B", b_pool, index=b_pool.index(pick_default("b", b_pool, taken=(a,))), key="r_b")
+        can_search = PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
+        web_search = st.toggle("🔎 웹 검색", value=can_search and bool(secret("WEB_SEARCH", True)),
+                               disabled=not can_search, key="r_search",
+                               help=f"허브가 필요할 때만 질문당 최대 {SEARCH_MAX_USES}회 검색합니다. "
+                                    "Claude는 1,000회당 10달러가 Team 크레딧에서 차감됩니다."
+                                    if can_search else f"{hub}는 웹 검색을 지원하지 않습니다.")
+        fast = st.toggle("⚡ 빠른 모드 (토론 생략)", value=False, key="r_fast",
+                         help="② 상호 토론을 건너뛰어 호출이 6회에서 4회로 줄고 더 빨리 끝납니다. "
+                              "대신 서로의 오류를 바로잡는 과정이 빠집니다.")
+        pick_models = st.checkbox("모델 직접 고르기", key="r_pick",
+                                  help="끄면 Secrets에 지정한 기본 모델을 씁니다.")
+        if pick_models:
+            models = {
+                "hub": model_picker(f"허브 · {hub}", hub, f"m_hub_{hub}"),
+                "a": model_picker(f"판단 A · {a}", a, f"m_a_{a}"),
+                "b": model_picker(f"판단 B · {b}", b, f"m_b_{b}"),
+            }
+            if st.button("🔄 모델 목록 새로고침", use_container_width=True):
+                list_models.clear()
+                st.rerun()
+        else:
+            models = {"hub": resolve_model(hub), "a": resolve_model(a), "b": resolve_model(b)}
+        if hub in (a, b):
+            st.caption("키가 2개뿐이라 허브가 판단자를 겸합니다.")
+    calls = 4 if fast else 6
+    summary.caption(f"🔮 {hub} 주재 · ⚖️ {a} vs {b}"
+                    + (" · 🔎" if web_search else "") + (" · ⚡" if fast else "") + f" · 호출 {calls}회")
+
+    active = {n: t for n, t in ss.cooldowns.items() if t > time.time()}
+    if active:
+        st.warning("⏸ " + ", ".join(f"{n} {clock(t)}까지" for n, t in active.items()) + " 자동 제외")
+        if st.button("제외 해제", use_container_width=True):
+            ss.cooldowns = {}
+            st.rerun()
 
     st.divider()
-    st.subheader("📚 대화 기록")
+    st.markdown("**📚 대화 기록**")
     if not store.remote:
-        st.caption("⚠️ 지금은 앱 서버에 임시 저장됩니다. 앱이 재시작되면 사라지니, "
-                   "Secrets에 `GITHUB_TOKEN`과 `DATA_REPO`를 넣어 비공개 GitHub 저장소에 보관하세요.")
+        st.caption("⚠️ 임시 저장 중 (앱 재시작 시 사라짐). Secrets에 `GITHUB_TOKEN`·`DATA_REPO`를 넣으면 영구 보관됩니다.")
     convs = conversation_list()
-    query = st.text_input("검색", placeholder="질문 내용으로 찾기", label_visibility="collapsed")
+    query = st.text_input("검색", placeholder="🔍 질문 내용으로 찾기", label_visibility="collapsed")
     shown = [c for c in convs if query.strip().lower() in c["title"].lower()] if query.strip() else convs
     if shown:
-        labels = {c["id"]: f"{c['updated'][5:]} · {c['title']} ({c['turns']}개)" for c in shown}
+        labels = {c["id"]: f"{c['updated'][5:]} · {c['title']} ({c['turns']})" for c in shown}
         current = ss.conv_id if ss.conv_id in labels else None
         pick = st.selectbox("지난 대화", list(labels), format_func=labels.get, label_visibility="collapsed",
                             index=list(labels).index(current) if current else 0)
-        c1, c2 = st.columns(2)
-        if c1.button("📂 열기", use_container_width=True, disabled=pick == ss.conv_id):
+        c1, c2, c3 = st.columns(3)
+        if c1.button("📂", help="열기", use_container_width=True, disabled=pick == ss.conv_id):
             open_conversation(pick)
             st.rerun()
-        if c2.button("🗑 삭제", use_container_width=True):
+        if c2.button("🗑", help="삭제", use_container_width=True):
             ss.confirm_delete = pick
+        if c3.button("🔄", help="목록 새로고침", use_container_width=True):
+            conversation_list(force=True)
+            st.rerun()
         if ss.get("confirm_delete") == pick:
-            st.warning(f"'{labels[pick]}' 대화를 지울까요? 되돌릴 수 없습니다.")
+            st.warning("이 대화를 지울까요? 되돌릴 수 없습니다.")
             d1, d2 = st.columns(2)
             if d1.button("삭제", type="primary", use_container_width=True):
                 try:
@@ -909,9 +997,12 @@ with st.sidebar:
                 st.rerun()
     else:
         st.caption("검색 결과가 없습니다." if query.strip() else "아직 저장된 대화가 없습니다.")
-    if st.button("🔄 기록 새로고침", use_container_width=True):
-        conversation_list(force=True)
-        st.rerun()
+
+roles = {"hub": hub, "a": a, "b": b}
+
+st.title(f"🔮 {APP_NAME}")
+st.caption("허브 AI가 질문을 정리하면 두 AI가 토론하고, 허브가 최종 결론을 판정합니다. "
+           "후속 질문은 직전 최종안을 기준으로 이어집니다.")
 
 
 def label(item):
@@ -1001,9 +1092,22 @@ if msg and (msg.text.strip() or msg.files):
             st.error("모델이 선택되지 않은 역할이 있습니다. 사이드바의 모델 선택을 확인하세요.")
             st.stop()
         with st.status("허브가 토론을 주재하는 중…", expanded=True) as status:
+            board = ProgressBoard(roles, status)
+
+            async def run_with_board():
+                ticker = asyncio.create_task(board.tick())
+                try:
+                    return await run_pipeline(ui, roles, models, board.note, ss.cooldowns, web_search,
+                                              board=board, fast=fast)
+                finally:
+                    board.running = False
+                    await ticker
+
             try:
-                result = asyncio.run(run_pipeline(ui, roles, models, st.write, ss.cooldowns, web_search))
-                status.update(label="판정 완료", state="complete", expanded=False)
+                result = asyncio.run(run_with_board())
+                board.render()
+                status.update(label=f"판정 완료 · {time.time() - board.t0:.0f}초", state="complete",
+                              expanded=False)
             except Exception as e:
                 result = None
                 status.update(label="실패", state="error")
