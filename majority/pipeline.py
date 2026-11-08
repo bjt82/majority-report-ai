@@ -1,5 +1,6 @@
 """토론 진행(되묻기 → 정리 → 1차 판단 → 반론 → 판정)과 한도 초과 모델 자동 제외."""
 import asyncio
+import contextlib
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -271,3 +272,20 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
             "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0),
             "fast": fast, "cost": round(sum(spent), 6)}
+
+
+async def run_with_ticker(job, render, interval: float = 1.0):
+    """job(코루틴)을 돌리면서 interval초마다 render()로 진행판을 그림.
+    render()에서 Streamlit의 중단·새 질문 신호(BaseException)가 오면 job을 즉시 취소하고 그 신호를 다시 던짐.
+    → 진행 중인 AI 호출이 끝나길 기다리지 않고 1초 안에 멈추며, 끝나지 않은 호출은 비용도 덜 듦."""
+    task = asyncio.create_task(job)
+    while not task.done():
+        try:
+            render()
+        except BaseException:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            raise
+        await asyncio.wait({task}, timeout=interval)
+    return task.result()
