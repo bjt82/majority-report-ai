@@ -309,6 +309,21 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         note(f"🔎 {brief_res['search_note']}")
     if brief_res.get("searches"):
         log(f"🔎 웹 검색 {brief_res['searches']}회, 출처 {len(sources)}개 확인")
+    if brief_res.get("fetches"):
+        log(f"🔎 페이지 본문 조회 {brief_res['fetches']}회 시도 (요청 날짜의 정보 확인 여부는 브리프 참고)")
+    visits = brief_res.get("browser_visits", [])
+    if visits:
+        succeeded = sum(bool(v.get("ok")) for v in visits)
+        log(f"🔎 브라우저 조회 {len(visits)}회 중 {succeeded}회 완료 (내용 일치 여부는 별도 검증)")
+        evidence = "\n".join(
+            f"- {v.get('url', '(주소 확인 실패)')}: "
+            + (f"브라우저 렌더링 완료, 조회 시각 {v.get('retrieved_at', '')}"
+               + (", 텍스트 일부 생략" if v.get("truncated") else "")
+               if v.get("ok") else f"브라우저 조회 실패 ({v.get('error', 'unknown')})")
+            for v in visits
+        )
+        brief += ("\n\n<browser_retrieval_log>\n" + evidence + "\n</browser_retrieval_log>\n"
+                  "(앱이 기록한 실제 조회 방식입니다. 렌더링 완료 자체는 요청 정보의 검증 성공을 뜻하지 않습니다.)")
     if not brief:
         log(f"허브 정리 실패 → 원래 질문으로 토론 진행 ({brief_res['text'][:100]})")
 

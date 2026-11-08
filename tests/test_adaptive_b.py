@@ -79,27 +79,30 @@ def test_timeouts_cancel_free_calls_and_leave_time_for_haiku(core, ai):
     assert r["firsts"][1]["ok"] and r["firsts"][1]["model"] == "claude-haiku-5-5"
 
 
-def test_free_budget_is_shared_between_first_and_debate(core, ai):
+def test_free_budget_is_shared_between_first_and_debate(core, ai, monkeypatch):
+    # Windows 타이머/시스템 부하가 30ms 대기를 넘겨도 예산 검증 결과는 같아야 함.
+    from types import SimpleNamespace
+    import majority.pipeline as pipeline
+    elapsed = 0.0
+    monkeypatch.setattr(pipeline, "time", SimpleNamespace(perf_counter=lambda: elapsed, time=time.time))
     core["AUTO_B_FREE_BUDGET_SEC"] = .09
     core["AUTO_B_FREE_CALL_SEC"] = .06
     calls = []
     original = core.ask
 
     async def record(*a, **kw):
+        nonlocal elapsed
         if a[0].startswith("판단 B") and a[1] in ("Groq", "Mistral"):
             calls.append(kw["timeout"])
+            if len(calls) == 1:
+                elapsed += .04
+            else:
+                elapsed += kw["timeout"]
+                return {"role": a[0], "name": a[1], "model": a[2], "ok": False,
+                        "timeout": True, "text": "시험용 시간 초과", "sec": kw["timeout"]}
         return await original(*a, **kw)
 
     core["ask"] = record
-    n = 0
-
-    async def groq():
-        nonlocal n
-        n += 1
-        await asyncio.sleep(.03 if n == 1 else 5)
-        return "첫 답변"
-
-    ai.behavior[("Groq", "openai/gpt-oss-120b")] = groq
     r = invoke(core, judge_timeout=.6)
     assert r["firsts"][1]["name"] == "Groq"
     assert r["debates"][1]["model"] == "claude-haiku-5-5"

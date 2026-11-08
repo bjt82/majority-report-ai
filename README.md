@@ -13,6 +13,19 @@
 3. **상호 토론**: A는 B의 답을, B는 A의 답을 반박하거나 인정하며 자기 입장을 고칩니다.
 4. **최종 판정**: 허브가 토론 전체를 보고 **Majority Report**(최종 결론)와 **Minority Report**(쟁점·판정 근거)를 냅니다.
 
+### 검색 결과와 실제 웹페이지 확인
+웹 검색을 켜면 Claude 허브는 **검색 → 페이지·PDF 본문 조회 → 필요하면 실제 Chromium 브라우저 조회**를 사용할 수 있습니다. 검색 발췌가 오래됐거나 본문이 비어 있거나 사용자가 보는 화면과 다를 때, `browser_read` 도구가 JavaScript 로딩 후 보이는 텍스트·뷰포트 화면·링크·탭·선택 항목을 읽습니다. 특정 사이트나 급식 정보에 한정된 기능이 아닙니다.
+
+브라우저는 읽기용 탭·일반 링크 이동·select/date 변경·스크롤·특정 텍스트 대기를 지원합니다. 매 호출은 새 세션이며, 첫 조회에서 반환된 controls를 보고 재조회에 필요한 조작 전체를 지정합니다. 최대 3회, 회당 30초·4개 조작·텍스트 24,000자로 제한하며 내용이 생략됐는지 표시합니다. 화면 이미지는 해당 허브 호출에만 전달하고 데이터 저장소에는 저장하지 않습니다. 조회 방식·시각·성공 여부를 기록하고, 렌더링 완료와 요청 정보 검증 성공을 구분합니다.
+
+브라우저는 사용자의 로그인 프로필을 사용하지 않습니다. 공개 웹의 GET/HEAD만 허용하고 내부 네트워크·POST·WebSocket·다운로드를 차단합니다. 따라서 로그인·CAPTCHA·봇 차단·POST/WebSocket으로만 제공되는 화면·일부 복잡한 UI는 읽지 못할 수 있습니다. 이때 ‘확인하지 못함’으로 답하고 자료 부재로 단정하지 않도록 합니다. ‘내일’은 앱 시간대(기본 한국)의 실제 날짜로 바꾸며, 검색 수집일과 자료의 적용 날짜도 구분합니다.
+
+정적 본문 조회는 최대 3회, 텍스트는 조회당 약 12,000토큰으로 제한합니다. 최신 조회 도구는 캐시를 우회하고, 미지원이면 구버전을 시도합니다(구버전은 캐시 우회 미지원). 본문/브라우저 조회 도구가 거부되면 가능한 검색 도구는 유지합니다. Gemini 허브에는 기존 검색 연동만 적용되며, 이 브라우저 도구는 Claude 허브용입니다.
+
+본문 조회와 자체 Chromium에는 별도 AI 도구 요금이 없지만, 읽은 텍스트·화면 이미지·추가 허브 응답의 토큰 비용과 서버 자원 사용이 늘어납니다. 기존 검색 비용과 구분합니다. ([Claude 본문 조회 도구](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool), [Playwright](https://playwright.dev/python/docs/library))
+
+**설치:** Streamlit Community Cloud는 저장소의 `packages.txt`로 Chromium과 한글 글꼴을 설치합니다. 로컬에서는 의존성을 설치한 뒤 `python -m playwright install chromium --only-shell`을 한 번 실행하세요. 요청 처리 중에 브라우저를 자동 설치하지 않습니다. Secrets의 `BROWSER_READING = false`로 브라우저 기능만 끌 수 있습니다.
+
 ### 기본 배치
 | 역할 | 기본 AI | 이유 |
 |---|---|---|
@@ -93,6 +106,7 @@ Claude는 단계마다 생각하는 정도(effort)를 다르게 씁니다. 되�
 | `majority/settings.py` | 설정값, Secrets 읽기, AI 공급자 등록부 |
 | `majority/models.py` | 모델 목록 조회, 한도 초과 시 낮은 모델, 판단자 기본 모델, 모델 이름 표시 |
 | `majority/llm.py` | 공급자별 AI 호출, 재시도·한도 판별, Claude·Gemini 사용량·비용 |
+| `majority/browser.py` | 격리된 Chromium 조회·화면 수집·읽기 조작·공개 네트워크 프록시 |
 | `majority/prompts.py` | 입력 정리, 단계별 프롬프트, 되묻기 질문 해석 |
 | `majority/pipeline.py` | 토론 진행(정리 → 1차 판단 → 반론 → 판정), 자동 제외 |
 | `majority/store.py` | 대화 기록 저장소 (GitHub 또는 로컬 `data/`) |
@@ -107,4 +121,6 @@ AI API를 실제로 부르지 않고 가짜 응답으로 로직과 화면 흐름
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q tests
 ```
+
+브라우저 통합 시험은 설치된 Chromium으로 JavaScript 지연 로딩·탭·선택 항목·링크 이동을 실제 검증합니다. `python -m playwright install chromium --only-shell` 설치 후 `BROWSER_TESTS=1` 환경 변수를 지정해 실행하세요. CI에서는 이 시험도 실행하며 외부 사이트나 실제 AI API를 호출하지 않습니다.
 

@@ -51,6 +51,10 @@ SEARCH_MAX_USES = 3                          # 허브가 질문 하나에 웹 �
 
 CLAUDE_SEARCH_TOOLS = ("web_search_20260318", "web_search_20250305")   # 최신 → 예전 버전 순으로 시도
 
+CLAUDE_FETCH_TOOLS = ("web_fetch_20260309", "web_fetch_20250910")
+FETCH_MAX_USES = 3
+FETCH_MAX_CONTENT_TOKENS = 12_000             # 페이지 본문이 질문당 입력을 과도하게 늘리지 않도록 제한
+
 
 COOLDOWN_MIN_SEC = 10 * 60                   # 분당 한도 초과 시 그 모델을 자동 제외하는 시간 (대기 시간을 모를 때)
 
