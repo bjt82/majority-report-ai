@@ -85,7 +85,9 @@ PROVIDERS = {
                    fallback=("claude-haiku-5-5",)),
     "Gemini": dict(kind="gemini", key="GEMINI_API_KEY", vision=True,
                    model=secret("GEMINI_MODEL", "gemini-3.8-flash"),
-                   fallback="auto"),
+                   fallback="auto",
+                   # 모델 목록을 못 불러올 때도 쓸 수 있는 Google의 고정 별칭 (항상 최신 flash-lite / flash를 가리킴)
+                   aliases=("gemini-flash-lite-latest", "gemini-flash-latest")),
     "Groq": dict(kind="openai", key="GROQ_API_KEY", vision=False,
                  base_url="https://api.groq.com/openai/v1",
                  # 무료 등급은 분당 토큰이 작아(gpt-oss-120b 8K) 요청 하나가 그 안에 들어가야 함
@@ -176,34 +178,52 @@ MODEL_LIST_RETRY_SEC = 60                    # 모델 목록 조회 실패 후 �
 
 @st.cache_resource
 def model_list_failures() -> dict:
-    """{AI 이름: 목록 조회 실패 시각}. 실패를 잠깐만 기억해서 매번 느려지지 않게 하되,
-    일시적인 서버 과부하로 실패한 목록이 오래 비어 있지 않게 함."""
+    """{AI 이름: (목록 조회 실패 시각, 이유)}. 실패를 잠깐만 기억해서 매번 느려지지 않게 하되,
+    일시적인 서버 과부하로 실패한 목록이 오래 비어 있지 않게 함. 이유는 설정 화면에 표시."""
     return {}
+
+
+MISSING_MODEL_SEC = 24 * 3600                # '모델 없음(404)'으로 확인된 모델을 다시 시도하지 않는 시간
+
+
+@st.cache_resource
+def missing_models() -> dict:
+    """{'AI/모델': 확인 시각}. 없는 모델을 매 질문마다 다시 호출하지 않도록 기억."""
+    return {}
+
+
+def is_missing(provider: str, model: str) -> bool:
+    return time.time() - missing_models().get(f"{provider}/{model}", 0) < MISSING_MODEL_SEC
 
 
 def model_ids(provider: str):
     """그 AI에서 쓸 수 있는 모델 id 목록. 조회 실패면 None (이때는 설정한 목록을 그대로 믿음).
     성공한 목록은 list_models가 1시간 기억하고, 실패는 1분만 기억함."""
     fails = model_list_failures()
-    if time.time() - fails.get(provider, 0) < MODEL_LIST_RETRY_SEC:
+    if time.time() - fails.get(provider, (0, ""))[0] < MODEL_LIST_RETRY_SEC:
         return None
     try:
         ids = [i for i, _ in list_models(provider, secret(PROVIDERS[provider]["key"]))]
-        fails.pop(provider, None)
-        return ids
-    except Exception:
-        fails[provider] = time.time()
+    except Exception as e:
+        fails[provider] = (time.time(), f"{type(e).__name__}: {str(e)[:120]}")
         return None
+    if not ids:                                   # 받았지만 조건에 맞는 모델이 없음 → 원인 확인용으로 기록
+        fails[provider] = (time.time(), "목록은 받았지만 대화용 모델이 0개로 걸러짐")
+        list_models.clear()
+        return None
+    fails.pop(provider, None)
+    return ids
 
 
-def guess_lower(primary: str) -> list:
-    """모델 목록을 못 불러왔을 때 이름으로 추정한 낮은 모델 (예: gemini-3.8-flash → gemini-3.8-flash-lite).
-    실제로 없는 모델이면 호출이 오류로 끝나고 다음 후보로 넘어가므로 안전함."""
+def guess_lower(provider: str, primary: str) -> list:
+    """모델 목록을 못 불러왔을 때의 낮은 모델: 이름으로 추정한 것(예: gemini-3.8-flash → gemini-3.8-flash-lite)
+    + 그 AI의 고정 별칭. 없는 모델이면 '모델 없음'으로 기억되고 다음 후보로 넘어가므로 안전함."""
+    out = []
     if "flash" in primary and "lite" not in primary:
-        return [primary.replace("flash", "flash-lite", 1)]
-    if "pro" in primary:
-        return [primary.replace("pro", "flash", 1)]
-    return []
+        out.append(primary.replace("flash", "flash-lite", 1))
+    elif "pro" in primary:
+        out.append(primary.replace("pro", "flash", 1))
+    return out + list(PROVIDERS[provider].get("aliases", ()))
 
 
 def fallbacks(provider: str, primary: str) -> list:
@@ -214,12 +234,13 @@ def fallbacks(provider: str, primary: str) -> list:
         conf = "auto" if conf.strip() == "auto" else [m.strip() for m in conf.split(",") if m.strip()]
     ids = model_ids(provider)
     if conf == "auto":
-        if not ids:                                   # 목록 조회 실패: 이름으로 추정
-            return guess_lower(primary) if primary else []
-        lite = sorted((i for i in ids if "flash-lite" in i), reverse=True)
-        flash = sorted((i for i in ids if "flash" in i and "lite" not in i), reverse=True)
-        conf = lite + flash
-    out = [m for m in conf if m and m != primary and (ids is None or m in ids)]
+        if not ids:                                   # 목록 조회 실패: 이름 추정 + 고정 별칭
+            conf = guess_lower(provider, primary or "")
+        else:
+            lite = sorted((i for i in ids if "flash-lite" in i), reverse=True)
+            flash = sorted((i for i in ids if "flash" in i and "lite" not in i), reverse=True)
+            conf = lite + flash
+    out = [m for m in conf if m and m != primary and (ids is None or m in ids) and not is_missing(provider, m)]
     return list(dict.fromkeys(out))[:FALLBACK_MAX]
 
 
@@ -919,6 +940,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
                 why = "요청이 이 AI의 무료 한도보다 큼"
             else:
                 why = error_reason(r["text"])
+                if why == "모델을 찾을 수 없음":   # 다음 질문부터는 시도하지 않음
+                    missing_models()[f"{failed}/{fmodel}"] = time.time()
             if not bench(slot, why, key):
                 board.done(key, r)
                 return r
@@ -1337,6 +1360,7 @@ with st.sidebar:
             if st.button("🔄 모델 목록 새로고침", use_container_width=True):
                 list_models.clear()
                 model_list_failures().clear()
+                missing_models().clear()
                 st.rerun()
         else:
             models = {"hub": resolve_model(hub), "a": resolve_model(a), "b": resolve_model(b)}
@@ -1349,6 +1373,9 @@ with st.sidebar:
                 steps.append(f"판단 {who}: {short(models[who.lower()])} → " + " → ".join(map(short, low)))
         if steps:
             st.caption("한도 초과 시 같은 AI의 낮은 모델로 자동 교체  \n" + "  \n".join(steps))
+        for n, (_, why) in model_list_failures().items():
+            if n in (a, b):
+                st.caption(f"⚠️ {n} 모델 목록을 불러오지 못해 추정한 이름으로 교체합니다 ({why})")
     calls = 4 if fast else 6
     summary.caption(f"🔮 {hub} 주재 · ⚖️ {a} vs {b}"
                     + (" · 🔎" if web_search else "") + (" · ❓" if clarify_on else "")
