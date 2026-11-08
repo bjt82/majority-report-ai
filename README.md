@@ -59,6 +59,20 @@ Claude는 단계마다 생각하는 정도(effort)를 다르게 씁니다. 되�
 > ⚠️ API 키는 절대 커밋하지 마세요. `APP_PASSWORD`는 **필수**입니다. 설정하지 않으면 앱이 열리지 않으며, 5번 연속 틀리면 1분간 잠깁니다.
 > 일부 무료 API는 입력 내용을 학습에 사용할 수 있으니 개인정보가 담긴 파일은 올리지 마세요.
 
+## 파일 구조
+| 파일 | 내용 |
+|---|---|
+| `app.py` | Streamlit 화면 (사이드바 설정, 진행판, 되묻기 양식, 결과 표시) |
+| `majority/settings.py` | 설정값, Secrets 읽기, AI 공급자 등록부 |
+| `majority/models.py` | 모델 목록 조회, 한도 초과 시 낮은 모델, 판단자 기본 모델, 모델 이름 표시 |
+| `majority/llm.py` | 공급자별 AI 호출, 재시도·한도 판별, Claude 사용량·비용 |
+| `majority/prompts.py` | 입력 정리, 단계별 프롬프트, 되묻기 질문 해석 |
+| `majority/pipeline.py` | 토론 진행(정리 → 1차 판단 → 반론 → 판정), 자동 제외 |
+| `majority/store.py` | 대화 기록 저장소 (GitHub 또는 로컬 `data/`) |
+| `tests/` | 시험 (실제 AI API는 부르지 않음) |
+
+> Secrets의 기본 모델 등(`GEMINI_MODEL` 등)을 바꾼 뒤에는 Streamlit Cloud에서 **Reboot app**을 해야 반영됩니다. 설정은 앱이 시작할 때 한 번 읽습니다.
+
 ## 시험
 AI API를 실제로 부르지 않고 가짜 응답으로 로직과 화면 흐름을 확인합니다. PR을 올리면 GitHub Actions가 자동으로 실행합니다.
 

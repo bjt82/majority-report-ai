@@ -6,11 +6,8 @@ import conftest
 
 def fresh_core():
     """실제 model_ids를 쓰는 이름공간 (공통 준비물은 model_ids를 가짜로 바꾸므로 따로 만듦)."""
-    src = conftest.APP.read_text(encoding="utf-8").split(conftest.UI_MARK)[0]
-    ns = conftest.Core(__file__=str(conftest.APP), __name__="app_core_models")
-    exec(compile(src, str(conftest.APP), "exec"), ns)
+    ns = conftest.load_core(fake_model_list=False)
     ns["secret"] = lambda k, d=None: "x" if k.endswith("_API_KEY") else d
-    ns["model_list_failures"]().clear()
     return ns
 
 
