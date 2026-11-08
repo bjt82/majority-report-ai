@@ -168,14 +168,39 @@ def model_picker(label: str, provider: str, key: str):
 
 
 # ───────────────────────── 한도 초과 시 낮은 모델로 내려가기 ─────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
+MODEL_LIST_RETRY_SEC = 60                    # 모델 목록 조회 실패 후 다시 시도하기까지
+
+
+@st.cache_resource
+def model_list_failures() -> dict:
+    """{AI 이름: 목록 조회 실패 시각}. 실패를 잠깐만 기억해서 매번 느려지지 않게 하되,
+    일시적인 서버 과부하로 실패한 목록이 오래 비어 있지 않게 함."""
+    return {}
+
+
 def model_ids(provider: str):
     """그 AI에서 쓸 수 있는 모델 id 목록. 조회 실패면 None (이때는 설정한 목록을 그대로 믿음).
-    실패도 10분간 기억해서, 키나 네트워크 문제로 매번 느려지지 않게 함."""
-    try:
-        return [i for i, _ in list_models(provider, secret(PROVIDERS[provider]["key"]))]
-    except Exception:
+    성공한 목록은 list_models가 1시간 기억하고, 실패는 1분만 기억함."""
+    fails = model_list_failures()
+    if time.time() - fails.get(provider, 0) < MODEL_LIST_RETRY_SEC:
         return None
+    try:
+        ids = [i for i, _ in list_models(provider, secret(PROVIDERS[provider]["key"]))]
+        fails.pop(provider, None)
+        return ids
+    except Exception:
+        fails[provider] = time.time()
+        return None
+
+
+def guess_lower(primary: str) -> list:
+    """모델 목록을 못 불러왔을 때 이름으로 추정한 낮은 모델 (예: gemini-3.8-flash → gemini-3.8-flash-lite).
+    실제로 없는 모델이면 호출이 오류로 끝나고 다음 후보로 넘어가므로 안전함."""
+    if "flash" in primary and "lite" not in primary:
+        return [primary.replace("flash", "flash-lite", 1)]
+    if "pro" in primary:
+        return [primary.replace("pro", "flash", 1)]
+    return []
 
 
 def fallbacks(provider: str, primary: str) -> list:
@@ -186,8 +211,8 @@ def fallbacks(provider: str, primary: str) -> list:
         conf = "auto" if conf.strip() == "auto" else [m.strip() for m in conf.split(",") if m.strip()]
     ids = model_ids(provider)
     if conf == "auto":
-        if not ids:
-            return []
+        if not ids:                                   # 목록 조회 실패: 이름으로 추정
+            return guess_lower(primary) if primary else []
         lite = sorted((i for i in ids if "flash-lite" in i), reverse=True)
         flash = sorted((i for i in ids if "flash" in i and "lite" not in i), reverse=True)
         conf = lite + flash
@@ -678,6 +703,20 @@ def cooldown_until(name: str, r: dict) -> float:
     return time.time() + COOLDOWN_MIN_SEC
 
 
+def error_reason(text: str) -> str:
+    """오류 메시지를 화면용 짧은 이유로."""
+    low = text.lower()
+    if any(k in low for k in ("503", "unavailable", "overloaded", "529")):
+        return "서버 과부하(일시적)"
+    if any(k in low for k in ("404", "not_found", "not found", "does not exist")):
+        return "모델을 찾을 수 없음"
+    if any(k in low for k in ("401", "403", "permission", "api key", "unauthorized")):
+        return "API 키·권한 오류"
+    if any(k in low for k in ("500", "internal")):
+        return "서버 오류(일시적)"
+    return f"오류 ({text[:60]})"
+
+
 def ckey(name: str, model: str) -> str:
     """제외 기록의 키. 한도는 모델마다 따로라서 'AI/모델' 단위로 기록."""
     return f"{name}/{model}"
@@ -746,10 +785,15 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
             note(f"⚠️ {who} {why} → 대신할 AI가 없어 이 판단자 없이 진행합니다.")
             return False
         n, m = sub
+        same = [x for x in chain(old, prim[slot]) if x != old_m]   # 교체 전 기준의 같은 AI 낮은 모델
         names[slot], mdl[slot] = n, m
         tried[slot].add(sub)
         if n != old:
             prim[slot] = m
+        if n != old and not same:
+            why += f" · {old}에 낮은 모델 없음"
+        elif n != old:
+            why += f" · {old}의 낮은 모델도 사용 불가"
         if n == old:
             how = f"같은 AI의 낮은 모델 {short(m)}로 진행"
         elif n == hub and m == models["hub"]:
@@ -796,7 +840,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
             elif r.get("too_large"):
                 why = "요청이 이 AI의 무료 한도보다 큼"
             else:
-                why = f"오류 ({r['text'][:60]})"
+                why = error_reason(r["text"])
             if not bench(slot, why, key):
                 board.done(key, r)
                 return r
@@ -1211,7 +1255,7 @@ with st.sidebar:
             }
             if st.button("🔄 모델 목록 새로고침", use_container_width=True):
                 list_models.clear()
-                model_ids.clear()
+                model_list_failures().clear()
                 st.rerun()
         else:
             models = {"hub": resolve_model(hub), "a": resolve_model(a), "b": resolve_model(b)}
