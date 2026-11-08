@@ -123,7 +123,6 @@ class ProgressBoard:
         self.bar = st.progress(0.0, text="시작하는 중…")
         self.box = st.empty()
         self.notes = st.container()
-        self.running = True
 
     def start(self, key, name, extra=""):
         self.rows[key].update(state="run", name=name, extra=extra, t=time.time())
@@ -193,11 +192,6 @@ class ProgressBoard:
         self.box.markdown("  \n".join(lines))
         if self.status is not None:
             self.status.update(label=f"{stage} · {elapsed}", expanded=self.expanded)
-
-    async def tick(self):
-        while self.running:
-            self.render()
-            await asyncio.sleep(1)
 
 
 @st.cache_resource
@@ -512,29 +506,28 @@ def make_input(question, answers=()):
                      images=ss.conv_images, history=history_pairs())
 
 
+def mark_stopped(question):
+    """⏹ 중단 버튼: 버튼을 누르면 Streamlit이 화면을 다시 그리며 진행 중인 토론이 즉시 취소됨."""
+    ss.stopped_q = question
+
+
 def run_turn(question, files, warns, answers, extra_cost=0.0):
     """토론 실행 → 결과 표시 → 저장. extra_cost: 되묻기 단계에서 쓴 비용."""
     ui = make_input(question, answers)
     with st.chat_message("assistant", avatar="🔮"):
         for w in warns:
             st.warning(w)
+        st.button("⏹ 중단", key="stop_run", on_click=mark_stopped, args=(question,),
+                  help="오타나 잘못된 질문이면 눌러서 바로 멈추세요. 고친 질문을 입력창에 바로 보내도 이전 질문은 멈춥니다.")
         status = st.status("허브가 토론을 주재하는 중…", expanded=True)
         with status:
             board = ProgressBoard(roles, status, models)
         board.live = st.empty()           # 최종 판정이 실시간으로 나타날 자리
         with status:
-
-            async def run_with_board():
-                ticker = asyncio.create_task(board.tick())
-                try:
-                    return await run_pipeline(ui, roles, models, board.note, cooldowns, web_search,
-                                              board=board, fast=fast, judge_timeout=judge_timeout)
-                finally:
-                    board.running = False
-                    await ticker
-
             try:
-                result = asyncio.run(run_with_board())
+                job = run_pipeline(ui, roles, models, board.note, cooldowns, web_search,
+                                   board=board, fast=fast, judge_timeout=judge_timeout)
+                result = asyncio.run(run_with_ticker(job, board.render))
                 board.render()
                 board.live.empty()            # 실시간 초안을 지우고 완성본으로 다시 그림
                 status.update(label=f"판정 완료 · {time.time() - board.t0:.0f}초", state="complete",
@@ -564,6 +557,10 @@ for t in ss.turns:
     show_question(t["q"], t["files"], t.get("clarify"))
     with st.chat_message("assistant", avatar="🔮"):
         render_result(t["result"])
+
+stopped = ss.pop("stopped_q", None)
+if stopped:
+    st.info(f"⏹ 질문을 중단했습니다. 고쳐서 다시 보내 주세요.\n\n> {stopped}")
 
 msg = st.chat_input(
     "질문을 입력하세요. 직전 결론에 대한 후속 질문도 됩니다. (📎로 PDF·TXT·MD·이미지 첨부)",
