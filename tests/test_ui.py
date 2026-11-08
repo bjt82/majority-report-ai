@@ -262,3 +262,21 @@ def test_clear_attachments(mock_app):
     button(at, "첨부 해제").click().run()
     assert at.session_state["conv_docs"] == "" and at.session_state["conv_images"] == []
     assert at.session_state["conv_files"] == []
+
+
+# ── 답변 평가 ──
+def test_thumbs_feedback_is_saved(mock_app, tmp_path):
+    at = start(mock_app, ALLOW_NO_PASSWORD=True)
+    at.toggle(key="r_clarify").set_value(False).run()
+    at.chat_input[0].set_value("1+1은?").run()
+    fb = at.feedback
+    assert len(fb) == 1                                   # 답변마다 👍/👎 하나
+    fb[0].set_value(1).run()                              # 👍
+    assert at.session_state["turns"][0]["rating"] == "up"
+    conv_dir = tmp_path / "data" / "conversations"
+    for _ in range(50):                                   # 뒤에서 저장되길 기다림
+        files = list(conv_dir.glob("*.json")) if conv_dir.exists() else []
+        if files and json.loads(files[0].read_text(encoding="utf-8"))["turns"][0].get("rating") == "up":
+            break
+        time.sleep(0.1)
+    assert json.loads(files[0].read_text(encoding="utf-8"))["turns"][0]["rating"] == "up"

@@ -1,5 +1,7 @@
 # 🔮 Majority Report AI
 
+> 작업을 이어받는 AI 도우미는 먼저 [`docs/HANDOFF.md`](docs/HANDOFF.md)를 읽어 주세요.
+
 허브 AI가 질문을 정리하면 두 AI가 토론하고, 허브가 최종 결론을 판정하는 상호 검토형 AI 허브입니다.
 
 ## 작동 방식

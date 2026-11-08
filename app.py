@@ -625,10 +625,24 @@ def run_turn(question, files, warns, answers, extra_cost=0.0, extra_costs=None):
 if ss.conv_id and ss.img_count and not ss.conv_images:
     st.info(f"이 대화에서 쓴 이미지 {ss.img_count}장은 기록에 저장되지 않습니다. "
             "이어서 이미지에 대해 물어보려면 다시 첨부해 주세요. 문서 내용은 그대로 이어집니다.")
-for t in ss.turns:
+def rate_turn(i, key):
+    """👍/👎 평가를 그 질문 기록에 남기고 저장 (나중에 설정 변경의 효과를 비교하는 근거)."""
+    v = ss.get(key)
+    ss.turns[i]["rating"] = {1: "up", 0: "down"}.get(v)
+    try:
+        save_conversation()
+    except Exception as e:
+        st.toast(f"평가 저장 실패: {str(e)[:60]}")
+
+
+for i, t in enumerate(ss.turns):
     show_question(t["q"], t["files"], t.get("clarify"))
     with st.chat_message("assistant", avatar="🔮"):
         render_result(t["result"])
+        if t["result"].get("final", {}) and t["result"]["final"].get("ok"):
+            key = f"rate_{ss.conv_id}_{i}"
+            st.feedback("thumbs", key=key, default={"up": 1, "down": 0}.get(t.get("rating")),
+                        on_change=rate_turn, args=(i, key))
 
 stopped = ss.pop("stopped_q", None)
 if stopped:
