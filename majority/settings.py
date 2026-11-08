@@ -22,6 +22,11 @@ CALL_TIMEOUT_SEC = 180                       # 허브 정리·최종 판정 한 
 
 JUDGE_TIMEOUT_DEFAULT = 90                   # 판단자 한 단계의 기본 시간 제한 (화면에서 변경)
 
+# 판단 B 자동 선택: 짧은 텍스트는 Groq → Mistral → Haiku, 긴 자료·이미지는 Haiku.
+AUTO_B_INPUT_CHARS = 5000
+AUTO_B_FREE_BUDGET_SEC = 15.0                # 질문 전체(1차·반론 합산)의 무료 후보 대기 상한
+AUTO_B_FREE_CALL_SEC = 7.5                   # 한 무료 후보에 쓰는 최대 시간
+
 
 RUNTIME = {"gemini_thinking": "low"}         # 화면 설정을 호출부에 전달 (Gemini 생각 수준)
 

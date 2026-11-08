@@ -62,6 +62,28 @@ def cooled(name: str, model: str, cooldowns: dict) -> bool:
     return cooldowns.get(ckey(name, model), 0) > time.time()
 
 
+def judge_b_plan(ui: UserInput, roles: dict, models: dict, cooldowns: dict):
+    """API 호출 없이 실제 입력으로 판단 B 경로 결정. 키 없는 AI·제외/404 모델은 건너뜀."""
+    full = bool(ui.images) or len(ui.base_text()) > AUTO_B_INPUT_CHARS
+    reason = "이미지 포함" if ui.images else (f"전체 입력 {AUTO_B_INPUT_CHARS:,}자 초과" if full else "짧은 텍스트")
+    available = available_providers()
+    candidates = []
+    if not full:
+        candidates += [(n, PROVIDERS[n]["model"]) for n in ("Groq", "Mistral") if n in available]
+    if "Claude" in available:
+        candidates.append(("Claude", "claude-haiku-5-5"))
+        # Haiku도 불가능하면 마지막으로 기존 Claude 기본 모델 사용.
+        candidates.append(("Claude", PROVIDERS["Claude"]["model"]))
+    elif full:
+        # Claude 키가 없는 구성에서는 원문·이미지를 받을 수 있는 기존 판단 B만 허용.
+        if PROVIDERS[roles["b"]]["vision"]:
+            candidates.append((roles["b"], models["b"]))
+    pair_a = (roles["a"], models["a"])
+    candidates = [(n, m) for n, m in dict.fromkeys(candidates)
+                  if m and (n, m) != pair_a and not cooled(n, m, cooldowns) and not is_missing(n, m)]
+    return {"mode": "full" if full else "free_first", "reason": reason, "candidates": candidates}
+
+
 class NullBoard:
     """진행판이 없을 때(테스트 등) 쓰는 빈 진행판."""
     stream = None
@@ -71,7 +93,7 @@ class NullBoard:
 
 
 async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns: dict, search=False,
-                       board=None, fast=False, judge_timeout=JUDGE_TIMEOUT_DEFAULT):
+                       board=None, fast=False, judge_timeout=JUDGE_TIMEOUT_DEFAULT, auto_judge_b=False):
     """cooldowns: {'AI/모델': 제외 해제 시각}. 사용량 초과가 나면 여기에 기록되어 다음 질문에도 자동 제외.
     board: 단계별 진행 상황을 그리는 진행판. fast: 상호 토론(②)을 건너뛰는 빠른 모드.
 
@@ -158,9 +180,66 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     def limit_of(name, factor=1.0):
         return int(PROVIDERS[name].get("max_input_chars", 0) * factor)
 
+    plan = judge_b_plan(ui, roles, models, cooldowns) if auto_judge_b else None
+    b_index, free_left = 0, AUTO_B_FREE_BUDGET_SEC
+    if plan:
+        route = " → ".join(f"{n} {pretty(m)}" for n, m in plan["candidates"])
+        note(f"🧭 판단 B 자동 선택 · {plan['reason']} · {route or '사용 가능한 판단자 없음'}")
+
+    async def adaptive_b_call(label, system, make, key):
+        """무료 후보는 질문 전체 15초만 사용. 단계 전체 상한 안에서 Haiku 응답 시간을 확보."""
+        nonlocal b_index, free_left
+        end = time.perf_counter() + judge_timeout
+        last = {"role": label, "name": names["b"], "model": mdl["b"], "ok": False,
+                "text": "판단 B에 사용할 수 있는 모델이 없습니다.", "sec": 0}
+        while b_index < len(plan["candidates"]):
+            name, model = plan["candidates"][b_index]
+            if (cooled(name, model, cooldowns) or is_missing(name, model)
+                    or (name, model) == (names["a"], mdl["a"])):
+                b_index += 1
+                continue
+            remaining = end - time.perf_counter()
+            if remaining <= 0:
+                break
+            free = name in ("Groq", "Mistral")
+            # 무료 시도로 단계 시간을 모두 쓰지 않게 최대 30초 또는 단계 시간의 절반을 남김.
+            reserve = min(30.0, judge_timeout / 2)
+            timeout = min(AUTO_B_FREE_CALL_SEC, free_left, remaining - reserve) if free else remaining
+            if timeout <= 0:
+                note(f"⌛ 판단 B · 무료 AI 대기 예산을 마쳐 {name} 대신 다음 후보로 진행합니다.")
+                b_index += 1
+                continue
+            names["b"], mdl["b"] = name, model
+            board.start(key, f"{name} · {pretty(model)}", "자동 선택")
+            t0 = time.perf_counter()
+            last = await tracked_ask(label, name, model, system, make(limit_of(name)), imgs, log,
+                                     timeout=timeout, max_wait=0 if free else QUICK_RETRY_SEC)
+            if free:
+                free_left = max(0, free_left - (time.perf_counter() - t0))
+            if last["ok"]:
+                board.done(key, last)
+                return last
+            if last.get("quota"):
+                cooldowns[ckey(name, model)] = cooldown_until(name, last)
+                why = f"사용량 한도 초과 ({clock(cooldowns[ckey(name, model)])}까지 자동 제외)"
+            elif last.get("timeout"):
+                why = f"{timeout:g}초 대기 초과"
+                if free:
+                    cooldowns[ckey(name, model)] = time.time() + 60
+            else:
+                why = error_reason(last["text"])
+                if why == "모델을 찾을 수 없음":
+                    missing_models()[ckey(name, model)] = time.time()
+            b_index += 1
+            note(f"⚠️ {label}({name} {pretty(model)}) {why} → 다음 후보로 전환합니다.")
+        board.done(key, last)
+        return last
+
     async def judge_call(slot, label, system, make, key):
         """make(입력 한도) → 그 판단자에게 맞는 크기의 프롬프트.
         judge_timeout은 교체·재시도까지 포함한 이 단계 전체의 시간 상한."""
+        if slot == "b" and plan is not None:
+            return await adaptive_b_call(label, system, make, key)
         end = time.perf_counter() + judge_timeout
 
         def call(limit):
@@ -202,6 +281,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     # 사용량 초과로 제외 중인 모델은 시작 전에 미리 교체 (해제되면 다음 질문부터 원래 모델로 돌아감)
     for slot in ("a", "b"):
+        if slot == "b" and plan is not None:
+            continue
         if cooled(names[slot], mdl[slot], cooldowns):
             until = clock(cooldowns[ckey(names[slot], mdl[slot])])
             bench(slot, f"사용량 초과로 {until}까지 제외 중")
@@ -283,7 +364,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
             "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0),
-            "fast": fast, "cost": round(sum(spent), 6), "costs": costs}
+            "fast": fast, "cost": round(sum(spent), 6), "costs": costs,
+            "judge_b_route": plan}
 
 
 async def run_with_ticker(job, render, interval: float = 1.0):

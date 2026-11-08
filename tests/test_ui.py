@@ -90,6 +90,7 @@ def test_password_gate_and_lockout(mock_app):
 # ── 기본 배치·비용 ──
 def test_default_roles_and_cost(mock_app, tmp_path):
     at = start(mock_app, ALLOW_NO_PASSWORD=True)
+    at.toggle(key="r_auto_b").set_value(False).run()  # 수동 Haiku 배치의 비용 회귀 시험
     assert not at.exception
     assert at.selectbox(key="r_a").value == "Gemini" and at.selectbox(key="r_b").value == "Claude"
     assert any("Claude(Sonnet 5.5) 주재 · ⚖️ Gemini vs Claude(Haiku 5.5)" in c.value for c in at.sidebar.caption)
@@ -118,6 +119,24 @@ def test_default_roles_and_cost(mock_app, tmp_path):
     assert entry["cost_by_provider"]["Gemini"][turn["at"][:7]] == pytest.approx(gemini_expected)
     assert any("이번 달 Gemini" in p.proto.text for p in at.sidebar.get("progress"))
     assert any("Gemini 약 $0.0300" in c.value for c in at.caption)
+
+
+def test_auto_judge_b_routes_short_and_long_input(mock_app):
+    at = start(mock_app, ALLOW_NO_PASSWORD=True)
+    assert at.toggle(key="r_auto_b").value and at.selectbox(key="r_b").disabled
+    assert any("자동 판단 B" in c.value for c in at.sidebar.caption)
+    at.toggle(key="r_clarify").set_value(False).run()
+    at.chat_input[0].set_value("짧은 질문").run()
+    assert not at.exception
+    short = at.session_state["turns"][-1]["result"]
+    assert short["firsts"][1]["name"] == "Groq" and short["judge_b_route"]["mode"] == "free_first"
+    at.session_state["conv_docs"] = "긴 자료 " * 1500
+    at.chat_input[0].set_value("이 문서의 세부 내용을 검토해 줘").run()
+    assert not at.exception
+    long = at.session_state["turns"][-1]["result"]
+    assert long["firsts"][1]["model"] == "claude-haiku-5-5" and long["judge_b_route"]["mode"] == "full"
+    at.toggle(key="r_auto_b").set_value(False).run()
+    assert not at.selectbox(key="r_b").disabled
 
 
 # ── 되묻기 ──

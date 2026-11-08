@@ -328,8 +328,13 @@ with st.sidebar:
         c1, c2 = st.columns(2)
         a = c1.selectbox("판단 A", judge_pool, index=judge_pool.index(pick_default("a", judge_pool)), key="r_a")
         engine["a"] = c1.empty()
+        auto_b = st.toggle("🧭 판단 B 자동 선택", value=bool(secret("AUTO_JUDGE_B", True)), key="r_auto_b",
+                           help="짧은 입력은 Groq → Mistral → Claude Haiku 순서. "
+                                "이미지나 전체 입력 5천 자 초과 시 Haiku를 우선합니다. "
+                                "무료 AI 대기는 질문 전체 최대 15초이며, 끄면 판단 B를 직접 고릅니다.")
         b_pool = [n for n in judge_pool if n != a] or judge_pool
-        b = c2.selectbox("판단 B", b_pool, index=b_pool.index(pick_default("b", b_pool, taken=(a,))), key="r_b")
+        b = c2.selectbox("판단 B", b_pool, index=b_pool.index(pick_default("b", b_pool, taken=(a,))), key="r_b",
+                         disabled=auto_b)
         engine["b"] = c2.empty()
         can_search = PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
         web_search = st.toggle("🔎 웹 검색", value=can_search and bool(secret("WEB_SEARCH", True)),
@@ -359,7 +364,8 @@ with st.sidebar:
             models = {
                 "hub": hub_m,
                 "a": model_picker(f"판단 A · {a}", a, f"m_a_{a}", judge_model(a, hub, hub_m)),
-                "b": model_picker(f"판단 B · {b}", b, f"m_b_{b}", judge_model(b, hub, hub_m)),
+                "b": ("claude-haiku-5-5" if b == "Claude" else resolve_model(b)) if auto_b else
+                     model_picker(f"판단 B · {b}", b, f"m_b_{b}", judge_model(b, hub, hub_m)),
             }
             if st.button("🔄 모델 목록 새로고침", use_container_width=True):
                 list_models.clear()
@@ -368,14 +374,21 @@ with st.sidebar:
                 st.rerun()
         else:
             hub_m = resolve_model(hub)
-            models = {"hub": hub_m, "a": judge_model(a, hub, hub_m), "b": judge_model(b, hub, hub_m)}
+            models = {"hub": hub_m, "a": judge_model(a, hub, hub_m),
+                      "b": (("claude-haiku-5-5" if b == "Claude" else resolve_model(b)) if auto_b
+                            else judge_model(b, hub, hub_m))}
         for role in ("hub", "a", "b"):               # 같은 AI라도 모델이 다르면 여기서 구분됨
-            engine[role].caption(f"🧠 {pretty(models[role]) or '모델 없음'}", help=models[role] or None)
+            engine[role].caption("🧠 자동 · 짧은 입력은 무료 AI, 긴 자료·이미지는 Haiku" if role == "b" and auto_b
+                                 else f"🧠 {pretty(models[role]) or '모델 없음'}", help=models[role] or None)
         for who, n in (("A", a), ("B", b)):
+            if who == "B" and auto_b:
+                continue
             if n == hub and models[who.lower()] == models["hub"]:
                 st.caption(f"⚠️ 판단 {who}가 허브와 같은 모델이라 상호 검토 효과가 줄어듭니다.")
         steps = []
         for who, n in (("A", a), ("B", b)):
+            if who == "B" and auto_b:
+                continue
             low = fallbacks(n, models[who.lower()] or "")
             if low:
                 steps.append(f"판단 {who}: {short(models[who.lower()])} → " + " → ".join(map(short, low)))
@@ -388,7 +401,8 @@ with st.sidebar:
     shared = hub in (a, b)                    # 허브와 같은 AI의 판단자가 있으면 모델명으로 구분
     def tag(n, m):
         return f"{n}({pretty(m)})" if shared and n == hub else n
-    summary.caption(f"🔮 {tag(hub, models['hub'])} 주재 · ⚖️ {tag(a, models['a'])} vs {tag(b, models['b'])}"
+    b_summary = "자동 판단 B" if auto_b else tag(b, models["b"])
+    summary.caption(f"🔮 {tag(hub, models['hub'])} 주재 · ⚖️ {tag(a, models['a'])} vs {b_summary}"
                     + (" · 🔎" if web_search else "") + (" · ❓" if clarify_on else "")
                     + (" · ⚡" if fast else "") + f" · 호출 {calls}회")
 
@@ -532,6 +546,11 @@ def run_turn(question, files, warns, answers, extra_cost=0.0, extra_costs=None):
     """토론 실행 → 결과 표시 → 저장. extra_cost: 되묻기 단계에서 쓴 비용."""
     ui = make_input(question, answers)
     extra_costs = extra_costs if extra_costs is not None else {roles["hub"]: extra_cost}
+    display_roles, display_models = dict(roles), dict(models)
+    if auto_b:
+        route = judge_b_plan(ui, roles, models, cooldowns)
+        if route["candidates"]:
+            display_roles["b"], display_models["b"] = route["candidates"][0]
     with st.chat_message("assistant", avatar="🔮"):
         for w in warns:
             st.warning(w)
@@ -539,13 +558,13 @@ def run_turn(question, files, warns, answers, extra_cost=0.0, extra_costs=None):
                   help="오타나 잘못된 질문이면 눌러서 바로 멈추세요. 고친 질문을 입력창에 바로 보내도 이전 질문은 멈춥니다.")
         status = st.status("허브가 토론을 주재하는 중…", expanded=True)
         with status:
-            board = ProgressBoard(roles, status, models, extra_costs)
+            board = ProgressBoard(display_roles, status, display_models, extra_costs)
             board.update_cost({})
         board.live = st.empty()           # 최종 판정이 실시간으로 나타날 자리
         with status:
             try:
                 job = run_pipeline(ui, roles, models, board.note, cooldowns, web_search,
-                                   board=board, fast=fast, judge_timeout=judge_timeout)
+                                   board=board, fast=fast, judge_timeout=judge_timeout, auto_judge_b=auto_b)
                 result = asyncio.run(run_with_ticker(job, board.render))
                 board.render()
                 board.live.empty()            # 실시간 초안을 지우고 완성본으로 다시 그림
