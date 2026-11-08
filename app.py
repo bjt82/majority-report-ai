@@ -218,10 +218,16 @@ ss.setdefault("conv_files", [])
 ss.setdefault("conv_id", None)    # 저장소에 기록된 현재 대화 id
 ss.setdefault("conv_created", None)
 ss.setdefault("img_count", 0)     # 지난 대화에서 쓴 이미지 수 (이미지는 저장하지 않음)
+ss.setdefault("turn_images", [])  # 이번 질문에 실제로 보낼 이미지 (기본: 이번에 첨부한 것만)
 store = ConversationStore()
 
 NEW_CONV_KEYS = ("turns", "conv_docs", "conv_images", "conv_files", "conv_id", "conv_created",
-                 "img_count", "history_cache", "pending")
+                 "img_count", "history_cache", "pending", "turn_images", "keep_images")
+
+
+def clear_attachments():
+    """대화에 쌓인 문서·이미지 첨부를 지움 (이미 끝난 질문의 기록은 그대로)."""
+    ss.conv_docs, ss.conv_images, ss.conv_files, ss.turn_images, ss.img_count = "", [], [], [], 0
 
 
 def reset_conversation():
@@ -425,6 +431,20 @@ with st.sidebar:
     st.caption("이 앱에 저장된 대화 기준 추정치입니다. 과거 Gemini 사용량·중단·삭제한 대화는 빠집니다. "
                "크레딧·세금·검색 무료 허용량은 반영하지 않습니다. 실제 청구는 Claude Console·AI Studio에서 확인하세요.")
 
+    if ss.conv_docs or ss.conv_images:
+        with st.expander(f"📎 첨부 관리 ({len(ss.conv_files)}개)"):
+            for name in ss.conv_files:
+                st.caption(f"· {name}")
+            if ss.conv_docs:
+                st.caption(f"문서 {len(ss.conv_docs):,}자는 이어지는 질문에서도 계속 참고합니다.")
+            if ss.conv_images:
+                st.toggle(f"이전 이미지 {len(ss.conv_images)}장도 계속 보내기", key="keep_images",
+                          help="끄면(기본) 이미지를 첨부한 질문에만 보냅니다. 켜면 이후 질문마다 모든 AI에 다시 보내 "
+                               "비용과 시간이 늘고, 판단 B는 Haiku로 고정됩니다.")
+            if st.button("첨부 해제", use_container_width=True, on_click=clear_attachments,
+                         help="이 대화에 쌓인 문서·이미지를 지워 다음 질문부터 보내지 않습니다."):
+                pass
+
     st.divider()
     st.markdown("**📚 대화 기록**")
     save_errors = save_worker()["errors"]
@@ -480,9 +500,19 @@ def label(item):
     return f"{item['role']} · {item['name']}{'' if item['ok'] else ' ❌'}"
 
 
+INFO_MARKS = ("🧭", "🔎", "💰")               # 일상 안내: 회색 글씨 / 그 밖(⚠️ ⌛ ✂️ 등)은 노란 경고
+
+
+def show_notice(n):
+    if n.startswith(INFO_MARKS):
+        st.caption(n)
+    else:
+        st.warning(n)
+
+
 def render_result(res):
     for n in res.get("notices", []):
-        st.warning(n)
+        show_notice(n)
     final = res["final"]
     if final and final["ok"]:
         major, minor = split_report(final["text"])
@@ -533,8 +563,9 @@ def history_pairs():
 
 
 def make_input(question, answers=()):
+    # 이미지는 이번 질문에 보낼 것만 (질문마다 모든 AI에 다시 보내면 비용·시간이 늘고 판단 B가 Haiku로 고정됨)
     return UserInput(prompt=with_clarification(question, answers), doc_text=ss.conv_docs,
-                     images=ss.conv_images, history=history_pairs())
+                     images=ss.turn_images, history=history_pairs())
 
 
 def mark_stopped(question):
@@ -579,6 +610,7 @@ def run_turn(question, files, warns, answers, extra_cost=0.0, extra_costs=None):
             for n, value in extra_costs.items():
                 result["costs"][n] = round(result["costs"].get(n, 0) + value, 6)
             render_result(result)
+            ss.turn_images = []               # 다음 질문에는 새로 첨부한 이미지만
             ss.turns.append({"q": question, "clarify": list(answers), "files": files, "result": result,
                              "at": now_text()})
             try:
@@ -623,6 +655,8 @@ if msg and (msg.text.strip() or msg.files):
             merged = merged[-MAX_DOC_CHARS:]
             warns.append(f"대화에 첨부된 문서가 길어 최근 {MAX_DOC_CHARS:,}자만 사용합니다.")
         ss.conv_docs = merged
+    earlier = list(ss.conv_images) if ss.get("keep_images") else []
+    ss.turn_images = earlier + images      # 기본은 이번에 첨부한 이미지만, 켜 두면 이전 이미지도
     ss.conv_images += images
     ss.conv_files += [n for n in new_names if n not in ss.conv_files]
 

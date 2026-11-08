@@ -16,7 +16,11 @@ import majority.models as _models
 from majority.prompts import CLARIFY_SYSTEM
 
 
+_llm.SEEN_IMAGES = getattr(_llm, "SEEN_IMAGES", [])     # 호출마다 전달된 이미지 수 (시험에서 확인)
+
+
 async def _mock(p, model, system, text, images, search=False, on_text=None, effort=None):
+    _llm.SEEN_IMAGES.append(len(images))
     if system == CLARIFY_SYSTEM:
         out = ('{{"ask": true, "questions": [{{"q": "어느 지역 기준인가요?", "options": ["서울", "부산"], "multi": false}},'
                ' {{"q": "관심 장르는?", "options": ["액션", "로맨스", "애니"], "multi": true}}]}}'
@@ -212,3 +216,49 @@ def test_background_save_failure_is_reported(mock_app):
             break
         time.sleep(0.25)
     assert any("대화 기록 저장 실패" in w.value for w in at.sidebar.warning)
+
+
+# ── 첨부 관리·알림 구분 ──
+def seen_images():
+    import majority.llm as llm
+    return llm.SEEN_IMAGES
+
+
+def with_earlier_image(at):
+    from majority.prompts import Attachment
+    at.session_state["conv_images"] = [Attachment(b"fake-png", "image/png")]
+    at.session_state["conv_files"] = ["image.png"]
+    return at
+
+
+def test_earlier_image_not_resent_by_default(mock_app):
+    at = with_earlier_image(start(mock_app, ALLOW_NO_PASSWORD=True))
+    at.toggle(key="r_clarify").set_value(False).run()
+    seen_images().clear()
+    at.chat_input[0].set_value("1+1은?").run()
+    assert not at.exception
+    assert seen_images() and all(n == 0 for n in seen_images())          # 이전 이미지는 보내지 않음
+    route = at.session_state["turns"][0]["result"]["judge_b_route"]
+    assert route["reason"] == "짧은 텍스트"                             # 그래서 판단 B도 무료 AI 우선
+    # 일상 안내(🧭)는 노란 경고가 아니라 회색 글씨
+    assert not any(w.value.startswith("🧭") for w in at.warning)
+    assert any(c.value.startswith("🧭") for c in at.caption)
+
+
+def test_keep_images_toggle_resends(mock_app):
+    at = with_earlier_image(start(mock_app, ALLOW_NO_PASSWORD=True))
+    at.toggle(key="r_clarify").set_value(False).run()
+    at.toggle(key="keep_images").set_value(True).run()
+    seen_images().clear()
+    at.chat_input[0].set_value("이 그림 다시 봐줘").run()
+    assert max(seen_images()) == 1
+    assert at.session_state["turns"][0]["result"]["judge_b_route"]["reason"] == "이미지 포함"
+
+
+def test_clear_attachments(mock_app):
+    at = with_earlier_image(start(mock_app, ALLOW_NO_PASSWORD=True))
+    at.session_state["conv_docs"] = "[파일: a.txt] 내용"
+    at.run()
+    button(at, "첨부 해제").click().run()
+    assert at.session_state["conv_docs"] == "" and at.session_state["conv_images"] == []
+    assert at.session_state["conv_files"] == []
