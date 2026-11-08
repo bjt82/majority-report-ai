@@ -1,40 +1,54 @@
 """Streamlit 화면 흐름 (AI 호출만 가짜로 바꾼 앱 사본을 AppTest로 조작)."""
+import importlib
 import json
 import time
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from conftest import APP
+from conftest import APP, MODULES, ROOT
 
-CALLERS_LINE = 'CALLERS = {"anthropic": call_anthropic, "gemini": call_gemini, "openai": call_openai_compat}'
 MOCK = '''
+import sys
+sys.path.insert(0, {root!r})
+import majority.llm as _llm
+import majority.models as _models
+from majority.prompts import CLARIFY_SYSTEM
+
+
 async def _mock(p, model, system, text, images, search=False, on_text=None, effort=None):
     if system == CLARIFY_SYSTEM:
-        out = ('{"ask": true, "questions": [{"q": "어느 지역 기준인가요?", "options": ["서울", "부산"], "multi": false},'
-               ' {"q": "관심 장르는?", "options": ["액션", "로맨스", "애니"], "multi": true}]}'
-               if "되묻기테스트" in text else '{"ask": false, "questions": []}')
+        out = ('{{"ask": true, "questions": [{{"q": "어느 지역 기준인가요?", "options": ["서울", "부산"], "multi": false}},'
+               ' {{"q": "관심 장르는?", "options": ["액션", "로맨스", "애니"], "multi": true}}]}}'
+               if "되묻기테스트" in text else '{{"ask": false, "questions": []}}')
     else:
-        out = f"[{model}] " + ("CLARIFIED " if "<clarification>" in text else "PLAIN ") + "답변"
+        out = f"[{{model}}] " + ("CLARIFIED " if "<clarification>" in text else "PLAIN ") + "답변"
     if on_text:
         on_text(out)
     if p["kind"] == "anthropic":
-        return out, {"usage": {"input": 10000, "output": 2000, "searches": 1 if search else 0}}
-    return out if p["kind"] == "openai" else (out, {})
-CALLERS = {"anthropic": _mock, "gemini": _mock, "openai": _mock}
-def model_ids(provider):
-    return {"Claude": ["claude-sonnet-5-5", "claude-haiku-5-5"], "Gemini": ["gemini-3.8-flash", "gemini-3.8-flash-lite"],
-            "Groq": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]}.get(provider)
+        return out, {{"usage": {{"input": 10000, "output": 2000, "searches": 1 if search else 0}}}}
+    return out if p["kind"] == "openai" else (out, {{}})
+
+
+def _model_ids(provider):
+    return {{"Claude": ["claude-sonnet-5-5", "claude-haiku-5-5"], "Gemini": ["gemini-3.8-flash", "gemini-3.8-flash-lite"],
+            "Groq": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]}}.get(provider)
+
+
+_llm.CALLERS.update({{"anthropic": _mock, "gemini": _mock, "openai": _mock}})
+_models.model_ids = _model_ids
+exec(compile(open({app!r}, encoding="utf-8").read(), {app!r}, "exec"))
 '''
 KEYS = ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY")
 
 
 @pytest.fixture
 def mock_app(tmp_path):
-    src = APP.read_text(encoding="utf-8")
-    assert CALLERS_LINE in src
-    path = tmp_path / "app.py"                # 대화 기록은 tmp_path/data 에 저장됨
-    path.write_text(src.replace(CALLERS_LINE, MOCK), encoding="utf-8")
+    """AI 호출만 가짜로 바꾸고 실제 app.py를 그대로 실행하는 시험용 진입 파일."""
+    for name in MODULES:                      # 로직 시험이 바꿔 둔 가짜(secret 등)가 남지 않게 새로 불러옴
+        importlib.reload(importlib.import_module(name))
+    path = tmp_path / "app_under_test.py"
+    path.write_text(MOCK.format(root=str(ROOT), app=str(APP)), encoding="utf-8")
     return path
 
 
@@ -42,6 +56,7 @@ def start(path, **secrets):
     at = AppTest.from_file(str(path), default_timeout=60)
     for k in KEYS:
         at.secrets[k] = "dummy"
+    at.secrets["LOCAL_DATA_DIR"] = str(path.parent / "data")      # 대화 기록은 시험 임시 폴더에
     for k, v in secrets.items():
         at.secrets[k] = v
     return at.run()

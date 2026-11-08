@@ -1,15 +1,20 @@
 """시험 공통 준비물.
 
-app.py는 Streamlit 화면 코드까지 한 파일에 들어 있어서, 로직 시험은 화면 부분('5) UI' 앞)만 불러와 씁니다.
+핵심 로직은 majority/ 패키지에 있고, 시험마다 모듈을 새로 불러와(reload) 앞 시험에서 바꾼 값이 남지 않게 합니다.
 실제 AI API는 부르지 않고 FakeAI가 대신 답하거나 오류를 냅니다.
 """
 import asyncio
+import importlib
 import pathlib
+import sys
 
 import pytest
 
-APP = pathlib.Path(__file__).resolve().parents[1] / "app.py"
-UI_MARK = "# ───────────────────────── 5) UI"
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+APP = ROOT / "app.py"
+sys.path.insert(0, str(ROOT))
+MODULES = ["majority.settings", "majority.models", "majority.llm",
+           "majority.prompts", "majority.pipeline", "majority.store"]   # 의존 순서
 KEYS = {"ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY"}
 # 각 AI의 'API 모델 목록'을 흉내 냄 (낮은 모델 목록은 여기 있는 것만 쓰임)
 MODELS = {
@@ -21,26 +26,45 @@ MODELS = {
 DAILY = "429 RESOURCE_EXHAUSTED GenerateRequestsPerDayPerProjectPerModel-FreeTier"
 
 
-class Core(dict):
-    """app.py 로직 부분의 전역 이름공간. core.ask처럼 점으로도 꺼낼 수 있음."""
+class Core:
+    """majority 모듈들을 한 이름공간처럼 다룸. core.ask / core["ask"]로 꺼내고,
+    core["secret"] = 가짜 처럼 바꾸면 그 이름을 가져다 쓰는 모든 모듈에 함께 적용됨 (별 import로 이름이 복사되므로)."""
+
+    def __init__(self, mods):
+        object.__setattr__(self, "_mods", mods)
+
+    def _find(self, name):
+        for m in reversed(self._mods):
+            if hasattr(m, name):
+                return getattr(m, name)
+        raise KeyError(name)
+
+    def __getitem__(self, name):
+        return self._find(name)
 
     def __getattr__(self, name):
         try:
-            return self[name]
+            return self._find(name)
         except KeyError as e:
             raise AttributeError(name) from e
 
+    def __setitem__(self, name, value):
+        old = self._find(name)
+        for m in self._mods:
+            if getattr(m, name, None) is old:
+                setattr(m, name, value)
 
-def load_core() -> Core:
-    src = APP.read_text(encoding="utf-8").split(UI_MARK)[0]
-    ns = Core(__file__=str(APP), __name__="app_core")
-    exec(compile(src, str(APP), "exec"), ns)
-    ns["secret"] = lambda k, d=None: "test-key" if k in KEYS else d
-    ns["model_ids"] = lambda p: MODELS.get(p)
-    ns["RETRY_WAIT_SEC"] = 0.2
-    ns["model_list_failures"]().clear()
-    ns["missing_models"]().clear()
-    return ns
+
+def load_core(fake_model_list=True) -> Core:
+    mods = [importlib.reload(importlib.import_module(n)) for n in MODULES]
+    core = Core(mods)
+    core["secret"] = lambda k, d=None: "test-key" if k in KEYS else d
+    if fake_model_list:
+        core["model_ids"] = lambda p: MODELS.get(p)
+    core["RETRY_WAIT_SEC"] = 0.2
+    core.model_list_failures().clear()
+    core.missing_models().clear()
+    return core
 
 
 class FakeAI:
