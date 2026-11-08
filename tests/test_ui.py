@@ -76,7 +76,9 @@ def test_default_roles_and_cost(mock_app, tmp_path):
     at = start(mock_app, ALLOW_NO_PASSWORD=True)
     assert not at.exception
     assert at.selectbox(key="r_a").value == "Gemini" and at.selectbox(key="r_b").value == "Claude"
-    assert any("Gemini vs Claude(haiku-5-5)" in c.value for c in at.sidebar.caption)
+    assert any("Claude(Sonnet 5.5) 주재 · ⚖️ Gemini vs Claude(Haiku 5.5)" in c.value for c in at.sidebar.caption)
+    engines = [c.value for c in at.sidebar.caption if c.value.startswith("🧠")]
+    assert engines == ["🧠 Sonnet 5.5", "🧠 Gemini 3.8 Flash", "🧠 Haiku 5.5"]   # 허브·A·B 모델 표시
     at.toggle(key="r_clarify").set_value(False).run()
     at.chat_input[0].set_value("1+1은?").run()
     assert not at.exception
