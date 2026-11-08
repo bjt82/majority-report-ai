@@ -24,6 +24,7 @@ import json
 import re
 import secrets as pysecrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -742,6 +743,9 @@ def verdict_prompt(ui: UserInput, brief: str, firsts: list, debates: list, sourc
         blocks.append(f'<debate judge="{d["role"]}">\n{d["text"]}\n</debate>')
     if len(firsts) == 1:
         blocks.append("다른 판단자의 답을 받지 못했습니다. 위 답을 직접 엄격히 검증·교정해 최종 결론을 내리세요.")
+    elif not firsts:
+        blocks.append("두 판단자의 답을 모두 받지 못했습니다. 브리프와 질문을 바탕으로 직접 답하세요. "
+                      "Minority Report에는 상호 검토 없이 허브가 단독으로 답했다는 점과 더 확인이 필요한 부분을 밝히세요.")
     if ui.history:
         blocks.append("직전 최종안과 이번 결론이 달라진다면, 무엇이 왜 바뀌었는지 최종 결론 안에서 짧게 밝히세요.")
     blocks.append(
@@ -1097,9 +1101,9 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         judge_call("b", "판단 B", JUDGE_SYSTEM, jp, "b1"),
     )
     firsts = [d for d in (fa, fb) if d["ok"]]
-    if not firsts:
-        raise RuntimeError(f"두 판단자 모두 실패했습니다.\n- 판단 A({fa['name']}): {fa['text']}\n"
-                           f"- 판단 B({fb['name']}): {fb['text']}")
+    if not firsts:                    # 둘 다 실패해도 답은 냄: 허브가 혼자 답하고 그 사실을 알림
+        note(f"⚠️ 두 판단자 모두 답하지 못해(판단 A {fa['name']}: {error_reason(fa['text'])} · "
+             f"판단 B {fb['name']}: {error_reason(fb['text'])}) 허브가 혼자 답합니다. 상호 검토가 빠진 답입니다.")
 
     # ② 상호 토론
     debates = []
@@ -1110,7 +1114,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         )
         debates = [d for d in (da, db) if d["ok"]]
     else:
-        why = "빠른 모드" if fast else "판단자 한쪽 실패"
+        why = "빠른 모드" if fast else ("판단자 모두 실패" if not firsts else "판단자 한쪽 실패")
         board.skip("a2", why)
         board.skip("b2", why)
 
@@ -1188,7 +1192,9 @@ class ConversationStore:
         if not self.remote:
             f = self.local_dir / path
             f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_text(text, encoding="utf-8")
+            tmp = f.with_name(f.name + ".tmp")      # 다 쓴 뒤 한 번에 바꿔서, 읽는 쪽이 반쯤 쓰인 파일을 보지 않게
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(f)
             return
         for _ in range(2):                       # 동시 수정으로 sha가 어긋나면 한 번 더
             body = {"message": message, "content": base64.b64encode(text.encode()).decode()}
@@ -1409,6 +1415,7 @@ def reset_conversation():
 
 def conversation_list(force=False):
     if force or "history_cache" not in ss:
+        flush_saves()
         try:
             ss.history_cache = store.list()
         except Exception as e:
@@ -1417,8 +1424,32 @@ def conversation_list(force=False):
     return ss.history_cache
 
 
+@st.cache_resource
+def save_worker() -> dict:
+    """대화 저장을 뒤에서 하나씩 처리하는 일꾼. GitHub 저장(API 여러 번 호출)이 끝나길 기다리지 않고 바로 화면을 갱신.
+    한 명이 순서대로 처리하므로 목록(index.json) 쓰기가 서로 꼬이지 않음."""
+    return {"pool": ThreadPoolExecutor(max_workers=1, thread_name_prefix="save"), "last": None, "errors": []}
+
+
+def _save_job(conv, errors):
+    try:
+        store.save(conv)
+    except Exception as e:                    # 화면 코드는 다른 스레드에서 못 쓰므로 기록해 두고 다음 화면에서 알림
+        errors.append(f"{conv['title'][:20]}: {str(e)[:80]}")
+
+
+def flush_saves(timeout=30):
+    """진행 중인 저장이 끝날 때까지 기다림 (대화 열기·삭제·목록 새로고침 전에 호출)."""
+    last = save_worker()["last"]
+    if last is not None:
+        try:
+            last.result(timeout=timeout)
+        except Exception:
+            pass
+
+
 def save_conversation():
-    """현재 대화를 저장소에 기록. 이미지 원본은 용량 때문에 저장하지 않음."""
+    """현재 대화를 저장소에 기록(뒤에서). 이미지 원본은 용량 때문에 저장하지 않음."""
     if not ss.conv_id:
         ss.conv_id = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d-%H%M%S-") + pysecrets.token_hex(2)
         ss.conv_created = now_text()
@@ -1429,11 +1460,18 @@ def save_conversation():
     conv = {"id": ss.conv_id, "title": ss.turns[0]["q"][:40], "created": ss.conv_created,
             "updated": now_text(), "turns": ss.turns, "docs": ss.conv_docs,
             "files": ss.conv_files, "images": len(ss.conv_images) + ss.img_count, "cost": monthly}
-    store.save(conv)
-    ss.pop("history_cache", None)
+    snapshot = json.loads(json.dumps(conv, ensure_ascii=False))     # 저장 중에 화면 쪽 데이터가 바뀌어도 안전하게 복사
+    worker = save_worker()
+    worker["last"] = worker["pool"].submit(_save_job, snapshot, worker["errors"])
+    # 사이드바 목록은 저장 완료를 기다리지 않고 바로 반영
+    entry = {"id": conv["id"], "title": conv["title"], "created": conv["created"], "updated": conv["updated"],
+             "turns": len(conv["turns"]), "cost": monthly}
+    if "history_cache" in ss:
+        ss.history_cache = [entry] + [c for c in ss.history_cache if c["id"] != conv["id"]]
 
 
 def open_conversation(cid):
+    flush_saves()
     conv = store.load(cid)
     if not conv:
         st.sidebar.error("대화를 찾을 수 없습니다.")
@@ -1550,6 +1588,9 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**📚 대화 기록**")
+    save_errors = save_worker()["errors"]
+    while save_errors:
+        st.warning(f"대화 기록 저장 실패 · {save_errors.pop(0)}")
     if not store.remote:
         st.caption("⚠️ 임시 저장 중 (앱 재시작 시 사라짐). Secrets에 `GITHUB_TOKEN`·`DATA_REPO`를 넣으면 영구 보관됩니다.")
     convs = conversation_list()
@@ -1574,6 +1615,7 @@ with st.sidebar:
             d1, d2 = st.columns(2)
             if d1.button("삭제", type="primary", use_container_width=True):
                 try:
+                    flush_saves()
                     store.delete(pick)
                     if pick == ss.conv_id:
                         reset_conversation()
@@ -1691,9 +1733,9 @@ def run_turn(question, files, warns, answers, extra_cost=0.0):
             ss.turns.append({"q": question, "clarify": list(answers), "files": files, "result": result,
                              "at": now_text()})
             try:
-                save_conversation()
+                save_conversation()               # 뒤에서 저장하므로 바로 넘어감 (실패는 다음 화면 사이드바에 표시)
             except Exception as e:
-                st.warning(f"대화 기록 저장에 실패했습니다 ({str(e)[:80]}). 답변은 이 화면에 그대로 남습니다.")
+                st.warning(f"대화 기록 저장을 시작하지 못했습니다 ({str(e)[:80]}). 답변은 이 화면에 그대로 남습니다.")
                 time.sleep(3)
             st.rerun()
 

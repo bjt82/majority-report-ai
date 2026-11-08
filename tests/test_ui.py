@@ -1,5 +1,6 @@
 """Streamlit 화면 흐름 (AI 호출만 가짜로 바꾼 앱 사본을 AppTest로 조작)."""
 import json
+import time
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -87,7 +88,12 @@ def test_default_roles_and_cost(mock_app, tmp_path):
     expected = 2 * (10000 * 2 + 2000 * 10) / 1e6 + 0.01 + 2 * (10000 * 0.1 + 2000 * 0.5) / 1e6
     assert turn["result"]["cost"] == pytest.approx(expected) and turn.get("at")
     assert any("💰 Claude 약 $" in c.value for c in at.caption)
-    idx = json.loads((tmp_path / "data" / "index.json").read_text(encoding="utf-8"))
+    index = tmp_path / "data" / "index.json"          # 저장은 뒤에서 하므로 잠깐 기다림
+    for _ in range(50):
+        if index.exists():
+            break
+        time.sleep(0.1)
+    idx = json.loads(index.read_text(encoding="utf-8"))
     assert next(iter(idx.values()))["cost"][turn["at"][:7]] == pytest.approx(expected)
 
 
@@ -133,3 +139,17 @@ def test_new_message_while_pending_discards_form(mock_app):
     at.chat_input[0].set_value("되묻기테스트 A").run()
     at.chat_input[0].set_value("1+1은?").run()
     assert "pending" not in at.session_state and at.session_state["turns"][0]["q"] == "1+1은?"
+
+
+def test_background_save_failure_is_reported(mock_app):
+    """저장소(GitHub)에 저장이 실패하면 답변은 그대로 두고 다음 화면 사이드바에 알림."""
+    at = start(mock_app, ALLOW_NO_PASSWORD=True, GITHUB_TOKEN="bad-token", DATA_REPO="nobody/does-not-exist-xyz")
+    at.toggle(key="r_clarify").set_value(False).run()
+    at.chat_input[0].set_value("1+1은?").run()
+    assert not at.exception and len(at.session_state["turns"]) == 1
+    for _ in range(40):                               # 뒤에서 저장 시도가 끝나길 기다림
+        at.run()
+        if any("대화 기록 저장 실패" in w.value for w in at.sidebar.warning):
+            break
+        time.sleep(0.25)
+    assert any("대화 기록 저장 실패" in w.value for w in at.sidebar.warning)
