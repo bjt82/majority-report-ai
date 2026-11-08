@@ -913,6 +913,21 @@ def short(model: str) -> str:
     return (model or "").rsplit("/", 1)[-1]
 
 
+def pretty(model: str) -> str:
+    """사람이 읽기 쉬운 모델 이름. claude-sonnet-5-5 → Sonnet 5.5, gemini-3.8-flash-lite → Gemini 3.8 Flash-Lite."""
+    m = short(model)
+    if m.startswith("claude-"):
+        parts = m.removeprefix("claude-").split("-")
+        words = [x for x in parts if not x.isdigit()]
+        nums = [x for x in parts if x.isdigit()]
+        return " ".join(w.capitalize() for w in words) + (f" {'.'.join(nums)}" if nums else "")
+    if m.startswith("gemini-"):
+        rest = m.removeprefix("gemini-").replace("flash-lite", "Flash-Lite").replace("-latest", " (최신)")
+        return "Gemini " + " ".join(w if not w.isalpha() or w[0].isupper() else w.capitalize()
+                                    for w in rest.split("-"))
+    return m
+
+
 class NullBoard:
     """진행판이 없을 때(테스트 등) 쓰는 빈 진행판."""
     stream = None
@@ -1447,11 +1462,14 @@ with st.sidebar:
     summary = st.empty()
     with st.expander("⚙️ 역할·모델 설정"):
         hub = st.selectbox("허브 (정리·판정)", avail, index=avail.index(pick_default("hub", avail)), key="r_hub")
+        engine = {"hub": st.empty()}      # 선택칸 바로 아래에 실제 모델명 (모델이 정해진 뒤 채움)
         judge_pool = avail                # 허브와 같은 AI도 판단자 가능 (다른 모델을 씀, 예: Haiku)
         c1, c2 = st.columns(2)
         a = c1.selectbox("판단 A", judge_pool, index=judge_pool.index(pick_default("a", judge_pool)), key="r_a")
+        engine["a"] = c1.empty()
         b_pool = [n for n in judge_pool if n != a] or judge_pool
         b = c2.selectbox("판단 B", b_pool, index=b_pool.index(pick_default("b", b_pool, taken=(a,))), key="r_b")
+        engine["b"] = c2.empty()
         can_search = PROVIDERS[hub]["kind"] in ("anthropic", "gemini")
         web_search = st.toggle("🔎 웹 검색", value=can_search and bool(secret("WEB_SEARCH", True)),
                                disabled=not can_search, key="r_search",
@@ -1490,11 +1508,11 @@ with st.sidebar:
         else:
             hub_m = resolve_model(hub)
             models = {"hub": hub_m, "a": judge_model(a, hub, hub_m), "b": judge_model(b, hub, hub_m)}
+        for role in ("hub", "a", "b"):               # 같은 AI라도 모델이 다르면 여기서 구분됨
+            engine[role].caption(f"🧠 {pretty(models[role]) or '모델 없음'}", help=models[role] or None)
         for who, n in (("A", a), ("B", b)):
             if n == hub and models[who.lower()] == models["hub"]:
                 st.caption(f"⚠️ 판단 {who}가 허브와 같은 모델이라 상호 검토 효과가 줄어듭니다.")
-            elif n == hub:
-                st.caption(f"판단 {who}는 허브와 같은 {n}의 다른 모델({short(models[who.lower()])})을 씁니다.")
         steps = []
         for who, n in (("A", a), ("B", b)):
             low = fallbacks(n, models[who.lower()] or "")
@@ -1506,9 +1524,10 @@ with st.sidebar:
             if n in (a, b):
                 st.caption(f"⚠️ {n} 모델 목록을 불러오지 못해 추정한 이름으로 교체합니다 ({why})")
     calls = 4 if fast else 6
+    shared = hub in (a, b)                    # 허브와 같은 AI의 판단자가 있으면 모델명으로 구분
     def tag(n, m):
-        return f"{n}({short(m).replace('claude-', '')})" if n == hub else n
-    summary.caption(f"🔮 {hub} 주재 · ⚖️ {tag(a, models['a'])} vs {tag(b, models['b'])}"
+        return f"{n}({pretty(m)})" if shared and n == hub else n
+    summary.caption(f"🔮 {tag(hub, models['hub'])} 주재 · ⚖️ {tag(a, models['a'])} vs {tag(b, models['b'])}"
                     + (" · 🔎" if web_search else "") + (" · ❓" if clarify_on else "")
                     + (" · ⚡" if fast else "") + f" · 호출 {calls}회")
 

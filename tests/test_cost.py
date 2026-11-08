@@ -92,3 +92,11 @@ def test_call_anthropic_collects_usage_through_real_sdk(core):
     chunks = []
     out, meta = asyncio.run(core.call_anthropic(p, "claude-sonnet-5-5", "sys", "q", [], on_text=chunks.append))
     assert out == "판정 결과" and chunks == ["판정 결과"] and meta["usage"] == {"input": 1200, "output": 800, "searches": 0}
+
+
+def test_pretty_model_names(core):
+    assert core.pretty("claude-sonnet-5-5") == "Sonnet 5.5"
+    assert core.pretty("claude-haiku-5-5") == "Haiku 5.5"
+    assert core.pretty("gemini-3.8-flash") == "Gemini 3.8 Flash"
+    assert core.pretty("openai/gpt-oss-120b") == "gpt-oss-120b"
+    assert core.pretty("") == ""
