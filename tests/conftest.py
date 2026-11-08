@@ -47,7 +47,7 @@ class FakeAI:
     """모든 AI 호출을 가로채는 가짜. behavior[(AI, 모델)]에 오류 문구나 async 함수를 넣어 상황을 만듦."""
 
     def __init__(self, core: Core):
-        self.core, self.behavior, self.calls = core, {}, []
+        self.core, self.behavior, self.calls, self.efforts = core, {}, [], []
         self.usage = {"input": 1000, "output": 500}
         for kind in ("anthropic", "gemini", "openai"):
             core["CALLERS"][kind] = self._make(kind)
@@ -56,9 +56,10 @@ class FakeAI:
         return f"answer from {name}/{model}"
 
     def _make(self, kind):
-        async def caller(p, model, system, text, images, search=False, on_text=None):
+        async def caller(p, model, system, text, images, search=False, on_text=None, effort=None):
             name = next(n for n, q in self.core["PROVIDERS"].items() if q is p)
             self.calls.append((name, model))
+            self.efforts.append((system, model, effort))
             b = self.behavior.get((name, model))
             if isinstance(b, str):
                 raise Exception(b)
@@ -66,7 +67,8 @@ class FakeAI:
             if on_text:
                 on_text(out)
             if kind == "anthropic":
-                return out, {"usage": {**self.usage, "searches": 1 if search else 0}}
+                return out, {"usage": {**self.usage, "searches": 1 if search else 0},
+                             "truncated": getattr(self, "truncate", None) == (name, model)}
             return out if kind == "openai" else (out, {})
         return caller
 

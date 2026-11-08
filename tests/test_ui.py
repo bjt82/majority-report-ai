@@ -8,7 +8,7 @@ from conftest import APP
 
 CALLERS_LINE = 'CALLERS = {"anthropic": call_anthropic, "gemini": call_gemini, "openai": call_openai_compat}'
 MOCK = '''
-async def _mock(p, model, system, text, images, search=False, on_text=None):
+async def _mock(p, model, system, text, images, search=False, on_text=None, effort=None):
     if system == CLARIFY_SYSTEM:
         out = ('{"ask": true, "questions": [{"q": "어느 지역 기준인가요?", "options": ["서울", "부산"], "multi": false},'
                ' {"q": "관심 장르는?", "options": ["액션", "로맨스", "애니"], "multi": true}]}'

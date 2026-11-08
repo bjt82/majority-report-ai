@@ -49,6 +49,8 @@ RUNTIME = {"gemini_thinking": "low"}         # 화면 설정을 호출부에 전
 RETRY_WAIT_SEC = 20                          # 요청 한도(429)·과부하 시 한 번 재시도 전 대기 (허브)
 QUICK_RETRY_SEC = 10                         # 판단자는 이보다 오래 기다려야 하면 재시도 대신 다른 모델로 교체
 FALLBACK_MAX = 3                             # 한 AI에서 한도 초과 시 내려갈 낮은 모델 최대 개수
+CLAUDE_MAX_TOKENS = 16_000                   # 한 번 응답의 최대 출력 (생각 토큰 포함)
+CLAUDE_MAX_TOKENS_STREAM = 32_000            # 스트리밍(최종 판정)은 시간 제한 걱정이 없어 더 넉넉히
 SEARCH_MAX_USES = 3                          # 허브가 질문 하나에 웹 검색할 수 있는 최대 횟수
 CLAUDE_SEARCH_TOOLS = ("web_search_20260318", "web_search_20250305")   # 최신 → 예전 버전 순으로 시도
 COOLDOWN_MIN_SEC = 10 * 60                   # 분당 한도 초과 시 그 모델을 자동 제외하는 시간 (대기 시간을 모를 때)
@@ -79,6 +81,15 @@ def secret(key: str, default=None):
         return st.secrets[key]
     except Exception:
         return default
+
+
+# Claude 생각 수준(effort): low < medium < high. 낮을수록 빠르고 저렴, 높을수록 꼼꼼함. None이면 모델 기본값
+# (Sonnet 5.5 기본 high, Haiku 5.5 기본 medium). Secrets의 CLAUDE_EFFORT_BRIEF 등으로 바꿀 수 있음.
+CLAUDE_EFFORT = {
+    "clarify": secret("CLAUDE_EFFORT_CLARIFY", "low"),      # 되물을 것이 있는지만 판단
+    "brief": secret("CLAUDE_EFFORT_BRIEF", "medium"),       # 질문 정리·웹 검색 (가장 오래 걸리던 단계)
+    "verdict": secret("CLAUDE_EFFORT_VERDICT", "high"),     # 최종 판정은 품질 우선
+}
 
 
 # ───────────────────────── AI 공급자 등록부 ─────────────────────────
@@ -378,27 +389,44 @@ def cost_of(model: str, usage) -> float:
     return (usage["input"] * pin + usage["output"] * pout) / 1_000_000 + usage["searches"] * WEB_SEARCH_PRICE
 
 
-async def call_anthropic(p, model, system, text, images, search=False, on_text=None):
+def effort_rejected(e: Exception) -> bool:
+    """이 모델이 생각 수준(effort) 설정을 받지 않는다는 오류인지."""
+    msg = str(e).lower()
+    return "effort" in msg or "output_config" in msg
+
+
+async def call_anthropic(p, model, system, text, images, search=False, on_text=None, effort=None):
     content = [{"type": "image",
                 "source": {"type": "base64", "media_type": img.mime, "data": b64(img.data)}}
                for img in images]
     content.append({"type": "text", "text": text})
+    extra = {"output_config": {"effort": effort}} if effort else {}
     if on_text and not search:            # 최종 판정: 글자가 나오는 대로 화면에 표시
         async with AsyncAnthropic(api_key=secret(p["key"])) as client:
-            async with client.messages.stream(model=model, max_tokens=8000, system=system,
-                                              messages=[{"role": "user", "content": content}]) as stream:
-                out = []
-                async for chunk in stream.text_stream:
-                    out.append(chunk)
-                    on_text(chunk)
-                final = await stream.get_final_message()
-                return "".join(out), {"usage": usage_of([final])}
+            while True:
+                try:
+                    async with client.messages.stream(model=model, max_tokens=CLAUDE_MAX_TOKENS_STREAM,
+                                                      system=system, **extra,
+                                                      messages=[{"role": "user", "content": content}]) as stream:
+                        out = []
+                        async for chunk in stream.text_stream:
+                            out.append(chunk)
+                            on_text(chunk)
+                        final = await stream.get_final_message()
+                        return "".join(out), {"usage": usage_of([final]),
+                                              "truncated": final.stop_reason == "max_tokens"}
+                except Exception as e:
+                    if extra and effort_rejected(e):      # 생각 수준을 지원하지 않는 모델이면 빼고 다시
+                        extra = {}
+                        on_text(None)
+                        continue
+                    raise
     meta = {"sources": [], "searches": 0, "search_note": ""}
     versions = list(CLAUDE_SEARCH_TOOLS) if search else []
     async with AsyncAnthropic(api_key=secret(p["key"])) as client:
         while True:
             tool = versions[0] if versions else None
-            kwargs = {}
+            kwargs = dict(extra)
             if tool:
                 kwargs["tools"] = [{"type": tool, "name": "web_search", "max_uses": SEARCH_MAX_USES,
                                     "allowed_callers": ["direct"],
@@ -410,8 +438,8 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
             try:
                 blocks, resps = [], []
                 for _ in range(4):        # 서버 도구가 길어지면 pause_turn으로 끊어 오므로 이어서 요청
-                    resp = await client.messages.create(model=model, max_tokens=8000, system=system,
-                                                        messages=messages, **kwargs)
+                    resp = await client.messages.create(model=model, max_tokens=CLAUDE_MAX_TOKENS,
+                                                        system=system, messages=messages, **kwargs)
                     resps.append(resp)
                     blocks += resp.content
                     if resp.stop_reason != "pause_turn":
@@ -420,6 +448,9 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                                             "content": [b.model_dump(exclude_none=True) for b in resp.content]}]
                 break
             except Exception as e:
+                if extra and effort_rejected(e):          # 생각 수준을 지원하지 않는 모델이면 빼고 다시
+                    extra = {}
+                    continue
                 if tool and search_disabled_error(e):
                     versions.pop(0)
                     if not versions:
@@ -442,10 +473,11 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                 meta["search_note"] = f"웹 검색 오류: {getattr(res, 'error_code', res)}"
     out = "".join(b.text for b in blocks if b.type == "text")
     meta["usage"] = usage_of(resps)
+    meta["truncated"] = bool(resps) and resps[-1].stop_reason == "max_tokens"
     return out, meta
 
 
-async def call_gemini(p, model, system, text, images, search=False, on_text=None):
+async def call_gemini(p, model, system, text, images, search=False, on_text=None, effort=None):
     client = genai.Client(api_key=secret(p["key"]))
     parts = [types.Part.from_bytes(data=img.data, mime_type=img.mime) for img in images]
     parts.append(text)
@@ -496,7 +528,7 @@ async def call_gemini(p, model, system, text, images, search=False, on_text=None
     return resp.text or "", meta
 
 
-async def call_openai_compat(p, model, system, text, images, search=False, on_text=None):
+async def call_openai_compat(p, model, system, text, images, search=False, on_text=None, effort=None):
     async with AsyncOpenAI(api_key=secret(p["key"]), base_url=p["base_url"]) as client:
         if on_text:
             stream = await client.chat.completions.create(
@@ -559,7 +591,7 @@ def retry_after(e: Exception):
 
 
 async def ask(role, name, model, system, text, images, log=None, search=False,
-              timeout=CALL_TIMEOUT_SEC, on_text=None, max_wait=RETRY_WAIT_SEC):
+              timeout=CALL_TIMEOUT_SEC, on_text=None, max_wait=RETRY_WAIT_SEC, effort=None):
     """예외를 삼키고 결과 dict로 돌려줘서 gather 전체가 깨지지 않게 함.
     timeout은 재시도까지 포함한 전체 시간 상한. 한도 초과·과부하면 API가 알려준 시간만큼 기다려 1회 재시도하되,
     max_wait보다 오래 기다려야 하면 재시도하지 않고 바로 실패를 돌려줌(호출한 쪽이 다른 모델로 교체)."""
@@ -573,6 +605,8 @@ async def ask(role, name, model, system, text, images, log=None, search=False,
     for attempt in (1, 2):
         try:
             kw = {"search": True} if search else {}
+            if effort and p["kind"] == "anthropic":   # 생각 수준은 Claude에만 적용
+                kw["effort"] = effort
             if on_text:
                 on_text(None)                 # 재시도면 화면에 쓰던 글을 비움
                 kw["on_text"] = on_text
@@ -589,7 +623,8 @@ async def ask(role, name, model, system, text, images, log=None, search=False,
                     "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1),
                     "sources": meta.get("sources", []), "searches": meta.get("searches", 0),
                     "search_note": meta.get("search_note", ""),
-                    "usage": usage, "cost": round(cost_of(model, usage), 6)}
+                    "usage": usage, "cost": round(cost_of(model, usage), 6),
+                    "truncated": bool(meta.get("truncated"))}
         except (asyncio.TimeoutError, TimeoutError):
             return {"role": role, "name": name, "model": model, "ok": False, "timeout": True,
                     "text": f"{timeout}초 안에 응답하지 않았습니다.", "sec": round(time.perf_counter() - t0, 1)}
@@ -789,6 +824,7 @@ async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, 
     cost = 0.0
     for m in dict.fromkeys(cands):
         r = await ask("허브 확인", hub, m, CLARIFY_SYSTEM, clarify_prompt(ui), ui.images, log,
+                      effort=CLAUDE_EFFORT["clarify"],
                       timeout=CLARIFY_TIMEOUT_SEC, max_wait=QUICK_RETRY_SEC)
         cost += r.get("cost", 0)
         if r["ok"]:
@@ -895,9 +931,11 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     board = board or NullBoard()
     spent = []                                        # 이번 질문에서 성공·실패 상관없이 청구된 비용
 
-    async def tracked_ask(*a, **k):                   # 모든 호출의 비용을 모으는 감싸개
+    async def tracked_ask(*a, **k):                   # 모든 호출의 비용을 모으고, 잘린 답은 알림
         r = await ask(*a, **k)
         spent.append(r.get("cost", 0) or 0)
+        if r.get("ok") and r.get("truncated"):
+            note(f"✂️ {r['role']}({r['name']})의 답이 최대 길이에 닿아 끝부분이 잘렸을 수 있습니다.")
         return r
 
     hub = roles["hub"]
@@ -1020,7 +1058,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         board.start("brief", hub if hm == models["hub"] else f"{hub} · {short(hm)}",
                     "필요하면 웹 검색" if search else "")
         brief_res = await tracked_ask("허브 정리", hub, hm, HUB_BRIEF_SYSTEM, brief_prompt(ui, search),
-                              imgs, log, search=search)
+                                      imgs, log, search=search, effort=CLAUDE_EFFORT["brief"])
         board.done("brief", brief_res)
         if brief_res["ok"] or not brief_res.get("quota") or i == len(hub_models) - 1:
             break
@@ -1073,7 +1111,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         board.start("verdict", name if is_hub_model else f"{name} · {short(model)}",
                     "" if is_hub_model else "허브 대신 판정")
         final = await tracked_ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log,
-                          on_text=getattr(board, "stream", None))
+                                  on_text=getattr(board, "stream", None), effort=CLAUDE_EFFORT["verdict"])
         board.done("verdict", final)
         if final["ok"]:
             break
