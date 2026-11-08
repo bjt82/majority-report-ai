@@ -71,7 +71,8 @@ def judge_b_plan(ui: UserInput, roles: dict, models: dict, cooldowns: dict):
     if not full:
         candidates += [(n, PROVIDERS[n]["model"]) for n in ("Groq", "Mistral") if n in available]
     if "Claude" in available:
-        candidates.append(("Claude", "claude-haiku-5-5"))
+        # 허브 쪽 가벼운 모델 (ANTHROPIC_FALLBACK 설정을 따름, 기본 Haiku 5.5)
+        candidates.append(("Claude", judge_model("Claude", "Claude", PROVIDERS["Claude"]["model"])))
         # Haiku도 불가능하면 마지막으로 기존 Claude 기본 모델 사용.
         candidates.append(("Claude", PROVIDERS["Claude"]["model"]))
     elif full:
