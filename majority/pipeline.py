@@ -309,6 +309,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         note(f"🔎 {brief_res['search_note']}")
     if brief_res.get("searches"):
         log(f"🔎 웹 검색 {brief_res['searches']}회, 출처 {len(sources)}개 확인")
+    if brief_res.get("fetches"):
+        log(f"🔎 페이지 본문 조회 {brief_res['fetches']}회 시도 (요청 날짜의 정보 확인 여부는 브리프 참고)")
     if not brief:
         log(f"허브 정리 실패 → 원래 질문으로 토론 진행 ({brief_res['text'][:100]})")
 

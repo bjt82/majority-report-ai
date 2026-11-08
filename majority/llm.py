@@ -20,7 +20,7 @@ def b64(data: bytes) -> str:
 def search_disabled_error(e: Exception) -> bool:
     """웹 검색 도구가 거부된 오류인지 (조직 설정에서 꺼짐, 도구 버전 미지원 등)."""
     msg = str(e).lower()
-    return "web_search" in msg or ("tool" in msg and ("not enabled" in msg or "not supported" in msg))
+    return "web_search" in msg or "web_fetch" in msg or ("tool" in msg and ("not enabled" in msg or "not supported" in msg))
 
 
 def usage_of(resps) -> dict:
@@ -151,19 +151,34 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                         on_text(None)
                         continue
                     raise
-    meta = {"sources": [], "searches": 0, "search_note": ""}
+    meta = {"sources": [], "searches": 0, "fetches": 0, "search_note": ""}
     versions = list(CLAUDE_SEARCH_TOOLS) if search else []
+    fetch_versions = list(CLAUDE_FETCH_TOOLS) if search else []
+
+    def tool_note(message):
+        meta["search_note"] = " · ".join(filter(None, (meta["search_note"], message)))
+
     async with AsyncAnthropic(api_key=secret(p["key"])) as client:
         while True:
             tool = versions[0] if versions else None
+            fetch_tool = fetch_versions[0] if fetch_versions else None
             kwargs = dict(extra)
+            tools = []
             if tool:
-                kwargs["tools"] = [{"type": tool, "name": "web_search", "max_uses": SEARCH_MAX_USES,
-                                    "allowed_callers": ["direct"],
-                                    "user_location": {"type": "approximate", "country": "KR",
-                                                      "timezone": "Asia/Seoul"}}]
+                tools.append({"type": tool, "name": "web_search", "max_uses": SEARCH_MAX_USES,
+                              "allowed_callers": ["direct"],
+                              "user_location": {"type": "approximate", "country": "KR",
+                                                "timezone": "Asia/Seoul"}})
                 if tool == "web_search_20250305":
-                    kwargs["tools"][0].pop("allowed_callers")
+                    tools[0].pop("allowed_callers")
+            if fetch_tool:
+                tools.append({"type": fetch_tool, "name": "web_fetch", "max_uses": FETCH_MAX_USES,
+                              "max_content_tokens": FETCH_MAX_CONTENT_TOKENS,
+                              "citations": {"enabled": True}})
+                if fetch_tool != "web_fetch_20250910":
+                    tools[-1].update(allowed_callers=["direct"], use_cache=False)
+            if tools:
+                kwargs["tools"] = tools
             messages = [{"role": "user", "content": content}]
             try:
                 blocks, resps = [], []
@@ -181,10 +196,16 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                 if extra and effort_rejected(e):          # 생각 수준을 지원하지 않는 모델이면 빼고 다시
                     extra = {}
                     continue
-                if tool and search_disabled_error(e):
-                    versions.pop(0)
-                    if not versions:
-                        meta["search_note"] = f"Claude 웹 검색을 쓸 수 없어 검색 없이 진행했습니다 ({str(e)[:80]})"
+                if (tool or fetch_tool) and search_disabled_error(e):
+                    msg = str(e).lower()
+                    if fetch_tool and (not tool or "web_fetch" in msg or "tools.1" in msg or "tools[1]" in msg):
+                        fetch_versions.pop(0)
+                        if not fetch_versions:
+                            tool_note("페이지 본문 직접 조회 도구를 쓸 수 없습니다. 검색 발췌만으로는 최신 내용을 확인하지 못할 수 있습니다.")
+                    else:
+                        versions.pop(0)
+                        if not versions:
+                            tool_note(f"Claude 웹 검색을 쓸 수 없어 검색 없이 진행했습니다 ({str(e)[:80]})")
                     continue
                 raise
 
@@ -200,7 +221,18 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                         seen.add(r.url)
                         meta["sources"].append({"title": r.title or r.url, "url": r.url})
             else:
-                meta["search_note"] = f"웹 검색 오류: {getattr(res, 'error_code', res)}"
+                tool_note(f"웹 검색 오류: {getattr(res, 'error_code', res)}")
+        elif b.type == "server_tool_use" and getattr(b, "name", "") == "web_fetch":
+            meta["fetches"] += 1
+        elif b.type == "web_fetch_tool_result":
+            res = b.content
+            if getattr(res, "type", "") == "web_fetch_result":
+                if res.url not in seen:
+                    seen.add(res.url)
+                    title = getattr(getattr(res, "content", None), "title", None) or res.url
+                    meta["sources"].append({"title": title, "url": res.url})
+            else:
+                tool_note(f"페이지 본문 조회 실패: {getattr(res, 'error_code', 'unknown')}")
     out = "".join(b.text for b in blocks if b.type == "text")
     meta["usage"] = usage_of(resps)
     meta["truncated"] = bool(resps) and resps[-1].stop_reason == "max_tokens"
@@ -371,6 +403,7 @@ async def ask(role, name, model, system, text, images, log=None, search=False,
             return {"role": role, "name": name, "model": model, "ok": ok,
                     "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1),
                     "sources": meta.get("sources", []), "searches": meta.get("searches", 0),
+                    "fetches": meta.get("fetches", 0),
                     "search_note": meta.get("search_note", ""),
                     "usage": usage, "billing_model": billing_model, "cost_note": cost_note,
                     "cost": round(cost_of(billing_model, usage), 6),
