@@ -21,7 +21,13 @@
 허브와 같은 AI를 판단자로 고르면 허브와 **다른 모델**(예: Sonnet 허브 → Haiku 판단자)을 기본으로 씁니다.
 
 ### 비용 표시
-Claude 응답의 실제 토큰 사용량과 웹 검색 횟수로 질문마다 비용을 계산해 답변 아래에 표시하고, 사이드바에 **이번 달 누적액 / 월 예산**(`CLAUDE_MONTHLY_BUDGET`, 기본 150달러)을 보여줍니다. 대화 기록으로 계산한 추정치이며, 정확한 금액은 console.anthropic.com에서 확인하세요.
+Claude와 Gemini 응답의 실제 사용량으로 **공급자별 추정 비용과 합계**를 표시합니다. 각 호출이 완료될 때 진행판의 비용이 갱신되고, 최종 답변 아래에는 되묻기·자동 교체를 포함한 질문 전체 비용이 표시됩니다. 생성 중인 토큰의 금액은 응답 사용량을 받기 전까지 확정하지 않습니다.
+
+사이드바에는 **이번 달 Claude / Gemini 누적액과 각각의 월 예산**을 표시합니다 (`CLAUDE_MONTHLY_BUDGET` 기본 $150, `GEMINI_MONTHLY_BUDGET` 기본 $10). Gemini는 유료 Standard 기준이며 무료 등급은 `GEMINI_PAID_TIER = false`로 설정합니다. 생각 토큰과 캐시 입력을 구분하고, Claude의 캐시 읽기·쓰기 및 Haiku의 긴 입력 단가도 반영합니다.
+
+Gemini 3.8 Flash는 [공식 단가](https://ai.google.dev/gemini-api/docs/pricing)의 2026년 출시 할인($0.75/$3.75)과 2027년 단가($1.50/$7.50)를 구분합니다. API 별칭은 응답의 실제 모델 이름으로 계산하며, 미등록 모델은 비용 누락 안내를 표시합니다. 추가 단가는 Secrets의 `GEMINI_PRICES` 표에 `[입력, 출력+생각, 캐시 입력]`(100만 토큰당 달러)을 지정할 수 있습니다.
+
+이 값은 **이 앱의 저장된 대화에 대한 추정 사용료**이며 청구 잔액은 아닙니다. 크레딧·세금·Gemini 검색 무료 허용량/검색 요금·외부 사용·중단/삭제한 대화는 반영하지 않습니다. 과거 기록의 Claude 비용은 유지하지만 당시 수집하지 않은 Gemini 비용은 복원하지 않습니다. 정확한 청구액은 [Claude Console](https://console.anthropic.com/)과 [Google AI Studio](https://aistudio.google.com/)에서 확인하세요.
 
 ### Claude 생각 수준
 Claude는 단계마다 생각하는 정도(effort)를 다르게 씁니다. 되묻기 `low`, 질문 정리 `medium`, 최종 판정 `high`(품질 우선)이며, `CLAUDE_EFFORT_CLARIFY`, `CLAUDE_EFFORT_BRIEF`, `CLAUDE_EFFORT_VERDICT`로 바꿀 수 있습니다. 낮을수록 빠르고 저렴합니다. 답이 최대 길이에 닿아 잘리면 화면에 알립니다.
@@ -68,7 +74,7 @@ Claude는 단계마다 생각하는 정도(effort)를 다르게 씁니다. 되�
 | `app.py` | Streamlit 화면 (사이드바 설정, 진행판, 되묻기 양식, 결과 표시) |
 | `majority/settings.py` | 설정값, Secrets 읽기, AI 공급자 등록부 |
 | `majority/models.py` | 모델 목록 조회, 한도 초과 시 낮은 모델, 판단자 기본 모델, 모델 이름 표시 |
-| `majority/llm.py` | 공급자별 AI 호출, 재시도·한도 판별, Claude 사용량·비용 |
+| `majority/llm.py` | 공급자별 AI 호출, 재시도·한도 판별, Claude·Gemini 사용량·비용 |
 | `majority/prompts.py` | 입력 정리, 단계별 프롬프트, 되묻기 질문 해석 |
 | `majority/pipeline.py` | 토론 진행(정리 → 1차 판단 → 반론 → 판정), 자동 제외 |
 | `majority/store.py` | 대화 기록 저장소 (GitHub 또는 로컬 `data/`) |

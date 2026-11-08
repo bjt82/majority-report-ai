@@ -93,7 +93,7 @@ class FakeAI:
             if kind == "anthropic":
                 return out, {"usage": {**self.usage, "searches": 1 if search else 0},
                              "truncated": getattr(self, "truncate", None) == (name, model)}
-            return out if kind == "openai" else (out, {})
+            return out if kind == "openai" else (out, {"usage": {**self.usage, "cached_input": 0, "searches": 0}})
         return caller
 
     def called(self, name, model):

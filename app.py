@@ -107,7 +107,7 @@ class ProgressBoard:
              ("a2", "② 반론 A"), ("b2", "② 반론 B"), ("verdict", "③ 최종 판정")]
     ICON = {"wait": "⬜", "run": "⏳", "ok": "✅", "fail": "❌", "skip": "⏭️"}
 
-    def __init__(self, roles, status, models=None):
+    def __init__(self, roles, status, models=None, initial_costs=None):
         self.t0 = time.time()
         self.status = status
         models = models or {}
@@ -122,7 +122,13 @@ class ProgressBoard:
         self.expanded = True              # 1초마다 라벨을 갱신할 때 펼침 상태를 함께 보내야 접히지 않음
         self.bar = st.progress(0.0, text="시작하는 중…")
         self.box = st.empty()
+        self.cost_box = st.empty()
+        self.initial_costs = dict(initial_costs or {})
         self.notes = st.container()
+
+    def update_cost(self, costs):
+        combined = {n: costs.get(n, 0) + self.initial_costs.get(n, 0) for n in ("Claude", "Gemini")}
+        self.cost_box.caption("💰 응답 완료분 · " + cost_caption(combined))
 
     def start(self, key, name, extra=""):
         self.rows[key].update(state="run", name=name, extra=extra, t=time.time())
@@ -264,18 +270,25 @@ def save_conversation():
         ss.conv_id = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d-%H%M%S-") + pysecrets.token_hex(2)
         ss.conv_created = now_text()
     monthly = {}
+    by_provider = {"Claude": {}, "Gemini": {}}
     for t in ss.turns:                      # 비용 기록이 생기기 전의 질문은 at·cost가 없어 빠짐
         if t.get("at") and t["result"].get("cost"):
             monthly[t["at"][:7]] = round(monthly.get(t["at"][:7], 0) + t["result"]["cost"], 6)
+        if t.get("at"):
+            m = t["at"][:7]
+            for n, value in result_costs(t["result"]).items():
+                if n in by_provider:
+                    by_provider[n][m] = round(by_provider[n].get(m, 0) + value, 6)
     conv = {"id": ss.conv_id, "title": ss.turns[0]["q"][:40], "created": ss.conv_created,
             "updated": now_text(), "turns": ss.turns, "docs": ss.conv_docs,
-            "files": ss.conv_files, "images": len(ss.conv_images) + ss.img_count, "cost": monthly}
+            "files": ss.conv_files, "images": len(ss.conv_images) + ss.img_count, "cost": monthly,
+            "cost_by_provider": by_provider}
     snapshot = json.loads(json.dumps(conv, ensure_ascii=False))     # 저장 중에 화면 쪽 데이터가 바뀌어도 안전하게 복사
     worker = save_worker()
     worker["last"] = worker["pool"].submit(_save_job, snapshot, worker["errors"])
     # 사이드바 목록은 저장 완료를 기다리지 않고 바로 반영
     entry = {"id": conv["id"], "title": conv["title"], "created": conv["created"], "updated": conv["updated"],
-             "turns": len(conv["turns"]), "cost": monthly}
+             "turns": len(conv["turns"]), "cost": monthly, "cost_by_provider": by_provider}
     if "history_cache" in ss:
         ss.history_cache = [entry] + [c for c in ss.history_cache if c["id"] != conv["id"]]
 
@@ -387,14 +400,16 @@ with st.sidebar:
             cooldowns.clear()
             st.rerun()
 
-    # 이번 달 Claude 비용 (저장된 대화 기록 기준 추정)
+    # 공급자별 월 누적 (구버전 기록의 cost는 Claude로 해석)
     month = datetime.now(ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))).strftime("%Y-%m")
     budget = float(secret("CLAUDE_MONTHLY_BUDGET", 150))
-    spent_month = sum((c.get("cost") or {}).get(month, 0) for c in conversation_list())
-    st.progress(min(spent_month / budget, 1.0) if budget else 0.0,
-                text=f"💰 이번 달 Claude 약 ${spent_month:.2f} / ${budget:.0f}")
-    st.caption("이 앱의 대화 기록으로 계산한 추정치입니다 (삭제한 대화는 빠짐). "
-               "정확한 금액은 console.anthropic.com에서 확인하세요.")
+    monthly = monthly_costs(conversation_list(), month)
+    for name, limit in (("Claude", budget), ("Gemini", float(secret("GEMINI_MONTHLY_BUDGET", 10)))):
+        st.progress(min(monthly[name] / limit, 1.0) if limit > 0 else 0.0,
+                    text=f"💰 이번 달 {name} 약 ${monthly[name]:.2f} / ${limit:.0f}")
+    st.caption(f"이번 달 합계 약 ${sum(monthly.values()):.2f}")
+    st.caption("이 앱에 저장된 대화 기준 추정치입니다. 과거 Gemini 사용량·중단·삭제한 대화는 빠집니다. "
+               "크레딧·세금·검색 무료 허용량은 반영하지 않습니다. 실제 청구는 Claude Console·AI Studio에서 확인하세요.")
 
     st.divider()
     st.markdown("**📚 대화 기록**")
@@ -461,7 +476,9 @@ def render_result(res):
         st.markdown(major)
         st.caption(f"최종 판정: {final['name']} · {final['sec']}초"
                    + (f" · 웹 검색 {res['searches']}회" if res.get("searches") else "")
-                   + (f" · 💰 Claude 약 ${res['cost']:.3f}" if res.get("cost") else ""))
+                   + (" · 💰 " + cost_caption(result_costs(res)) if res.get("costs") or res.get("cost") else ""))
+        if "costs" not in res:
+            st.caption("이전 기록: Gemini 비용은 수집되지 않았습니다.")
         if res.get("sources"):
             with st.expander(f"🔎 허브가 확인한 출처 ({len(res['sources'])}개)"):
                 for src in res["sources"]:
@@ -511,9 +528,10 @@ def mark_stopped(question):
     ss.stopped_q = question
 
 
-def run_turn(question, files, warns, answers, extra_cost=0.0):
+def run_turn(question, files, warns, answers, extra_cost=0.0, extra_costs=None):
     """토론 실행 → 결과 표시 → 저장. extra_cost: 되묻기 단계에서 쓴 비용."""
     ui = make_input(question, answers)
+    extra_costs = extra_costs if extra_costs is not None else {roles["hub"]: extra_cost}
     with st.chat_message("assistant", avatar="🔮"):
         for w in warns:
             st.warning(w)
@@ -521,7 +539,8 @@ def run_turn(question, files, warns, answers, extra_cost=0.0):
                   help="오타나 잘못된 질문이면 눌러서 바로 멈추세요. 고친 질문을 입력창에 바로 보내도 이전 질문은 멈춥니다.")
         status = st.status("허브가 토론을 주재하는 중…", expanded=True)
         with status:
-            board = ProgressBoard(roles, status, models)
+            board = ProgressBoard(roles, status, models, extra_costs)
+            board.update_cost({})
         board.live = st.empty()           # 최종 판정이 실시간으로 나타날 자리
         with status:
             try:
@@ -538,6 +557,8 @@ def run_turn(question, files, warns, answers, extra_cost=0.0):
                 st.error(str(e))
         if result:
             result["cost"] = round(result.get("cost", 0) + extra_cost, 6)
+            for n, value in extra_costs.items():
+                result["costs"][n] = round(result["costs"].get(n, 0) + value, 6)
             render_result(result)
             ss.turns.append({"q": question, "clarify": list(answers), "files": files, "result": result,
                              "at": now_text()})
@@ -588,20 +609,22 @@ if msg and (msg.text.strip() or msg.files):
         st.error("모델이 선택되지 않은 역할이 있습니다. 사이드바의 모델 선택을 확인하세요.")
         st.stop()
 
-    questions, clarify_cost = [], 0.0
+    questions, clarify_cost, clarify_costs, clarify_notes = [], 0.0, {}, []
     if clarify_on:
         holder = st.empty()               # 확인이 끝나면 말풍선째 지워서 빈 칸이 남지 않게 함
         with holder.container():
             with st.chat_message("assistant", avatar="🔮"):
                 with st.spinner("허브가 질문을 확인하는 중…"):
                     questions, clarify_cost = asyncio.run(
-                        hub_clarify(make_input(question), hub, models["hub"], cooldowns))
+                        hub_clarify(make_input(question), hub, models["hub"], cooldowns,
+                                    log=clarify_notes.append, cost_details=clarify_costs))
         holder.empty()
+    warns.extend(clarify_notes)
     if questions:                         # 화면을 다시 그려 선택형 질문을 보여줌
         ss.pending = {"id": pysecrets.token_hex(3), "q": question, "files": new_names,
-                      "warns": warns, "questions": questions, "cost": clarify_cost}
+                      "warns": warns, "questions": questions, "cost": clarify_cost, "costs": clarify_costs}
         st.rerun()
-    run_turn(question, new_names, warns, [], clarify_cost)
+    run_turn(question, new_names, warns, [], clarify_cost, clarify_costs)
 
 elif ss.get("pending"):
     pend = ss.pending
@@ -641,4 +664,4 @@ elif ss.get("pending"):
             with st.chat_message("user"):
                 for a in answers:
                     st.caption(f"❓ {a['q']} → **{a['a']}**")
-        run_turn(pend["q"], pend["files"], pend["warns"], answers, pend.get("cost", 0.0))
+        run_turn(pend["q"], pend["files"], pend["warns"], answers, pend.get("cost", 0.0), pend.get("costs"))

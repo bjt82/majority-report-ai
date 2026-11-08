@@ -89,7 +89,9 @@ class ConversationStore:
         idx = self._read("index.json") or {}
         idx[conv["id"]] = {"title": conv["title"], "created": conv["created"],
                            "updated": conv["updated"], "turns": len(conv["turns"]),
-                           "cost": conv.get("cost", {})}          # {"2026-11": 달러} 월별 Claude 비용
+                           "cost": conv.get("cost", {}),
+                           "cost_by_provider": conv.get("cost_by_provider", {
+                               "Claude": conv.get("cost", {}), "Gemini": {}})}
         self._write("index.json", idx, f"목록 갱신: {conv['title']}")
 
     def delete(self, cid):
