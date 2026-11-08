@@ -113,3 +113,26 @@ def test_notice_explains_when_lower_models_all_cooled(run, ai):
     cd = {"Gemini/gemini-3.8-flash-lite": time.time() + 600, "Gemini/gemini-3.5-flash": time.time() + 600}
     r = run(cooldowns=cd)
     assert r["firsts"][0]["name"] == "Mistral" and "낮은 모델도 사용 불가" in r["notices"][0]
+
+
+def test_no_judge_at_all_still_returns_verdict(core, ai):
+    import asyncio
+    for name, ms in MODELS.items():
+        if name != "Claude":
+            for m in ms + ["gemini-flash-lite-latest", "gemini-flash-latest", "qwen/qwen3-32b"]:
+                ai.behavior[(name, m)] = DAILY
+    # Claude는 판단자(대타 포함)로 불릴 때만 실패하고, 허브의 정리·판정은 성공하게 함
+    orig = core.CALLERS["anthropic"]
+
+    async def anthropic(p, model, system, text, images, search=False, on_text=None, effort=None):
+        if system in (core.JUDGE_SYSTEM, core.DEBATE_SYSTEM):
+            raise Exception(DAILY)
+        return await orig(p, model, system, text, images, search=search, on_text=on_text, effort=effort)
+    core.CALLERS["anthropic"] = anthropic
+    ui = core.UserInput(prompt="q")
+    r = asyncio.run(core.run_pipeline(ui, {"hub": "Claude", "a": "Gemini", "b": "Groq"},
+                                      {"hub": "claude-sonnet-5-5", "a": "gemini-3.8-flash", "b": "openai/gpt-oss-120b"},
+                                      lambda m: None, {}))
+    assert not any(f["ok"] for f in r["firsts"])
+    assert r["final"]["ok"] and r["debates"] == []
+    assert any("허브가 혼자 답합니다" in n for n in r["notices"])
