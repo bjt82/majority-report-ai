@@ -602,7 +602,9 @@ stopped = ss.pop("stopped_q", None)
 if stopped:
     st.info(f"⏹ 질문을 중단했습니다. 고쳐서 다시 보내 주세요.\n\n> {stopped}")
 
-msg = st.chat_input(
+# 명시적 하단 배치: 루트 st.chat_input의 페이지 자동 스크롤과
+# 긴 답변·expander 높이 변화가 충돌하지 않게, 일반 페이지 스크롤을 유지.
+msg = st.bottom.chat_input(
     "질문을 입력하세요. 직전 결론에 대한 후속 질문도 됩니다. (📎로 PDF·TXT·MD·이미지 첨부)",
     accept_file="multiple", file_type=["pdf", "txt", "md", *IMAGE_MIME.keys()],
 )

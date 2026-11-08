@@ -1,4 +1,4 @@
-streamlit>=1.43
+streamlit>=1.65,<2
 anthropic>=2.6
 google-genai>=1.0
 openai>=1.40
