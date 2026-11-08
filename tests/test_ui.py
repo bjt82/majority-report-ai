@@ -139,6 +139,23 @@ def test_auto_judge_b_routes_short_and_long_input(mock_app):
     assert not at.selectbox(key="r_b").disabled
 
 
+def test_pinned_input_does_not_force_page_autoscroll(mock_app):
+    """하단 입력창은 유지하되 펼침·긴 답변의 높이 변화가 자동 스크롤을 켜지 않음."""
+    at = start(mock_app, ALLOW_NO_PASSWORD=True)
+    assert not at.exception and len(at.chat_input) == 1
+    assert not at.chat_input[0].proto.is_auto_positioned_at_bottom
+    at.toggle(key="r_clarify").set_value(False).run()
+    at.chat_input[0].set_value("스크롤 검증").run()
+    assert not at.exception
+    result = at.session_state["turns"][0]["result"]
+    result["final"]["text"] = "긴 답변 단락\n\n" * 200 + "최종 답변 끝"
+    result["brief"]["text"] = "긴 토론 단락\n\n" * 200 + "토론 과정 끝"
+    at.run()
+    assert not at.exception and not at.chat_input[0].proto.is_auto_positioned_at_bottom
+    assert any("최종 답변 끝" in m.value for m in at.markdown)
+    assert any("토론 과정 끝" in m.value for m in at.markdown)
+
+
 # ── 되묻기 ──
 def test_clarify_answer_flows_into_debate(mock_app):
     at = start(mock_app, ALLOW_NO_PASSWORD=True)
