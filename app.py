@@ -59,6 +59,14 @@ CLARIFY_MAX_OPTS = 5                         # 질문 하나의 선택지 최대
 MAX_HISTORY_TURNS = 6                        # 후속 질문 때 함께 보낼 이전 대화 수
 LATEST_ANSWER_CHARS = 12_000                 # 직전 최종안은 거의 전부 전달
 OLDER_ANSWER_CHARS = 3_000                   # 그 이전 최종안은 요약 분량만
+# Claude API 요금 (100만 토큰당 달러: 입력, 출력). 생각(thinking) 토큰은 출력에 포함되어 청구됨.
+# 표에 없는 모델은 비용을 계산하지 않음. Haiku 5.5는 입력 10만 토큰 초과 시 더 비싸지만 이 앱에선 드묾.
+CLAUDE_PRICES = {
+    "claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50),
+    "claude-opus-5": (5.00, 25.00), "claude-sonnet-5": (2.00, 10.00),
+    "claude-sonnet-4-6": (3.00, 15.00), "claude-haiku-4-5": (1.00, 5.00),
+}
+WEB_SEARCH_PRICE = 10 / 1000                 # Claude 웹 검색 1회 (1,000회당 10달러)
 IMAGE_MIME = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "webp": "image/webp", "gif": "image/gif",
@@ -106,9 +114,10 @@ PROVIDERS = {
                        model=secret("OPENROUTER_MODEL", ""),
                        only_suffix=":free"),          # 무료 모델만 표시
 }
+# 기본 배치: 허브 Claude(Sonnet) · 판단 A Gemini(무료) · 판단 B Claude(Haiku, 한도에 걸리지 않는 고정 판단자)
 DEFAULT_ROLES = {"hub": ["Claude", "Gemini"],
                  "a": ["Gemini", "Mistral", "OpenRouter", "Groq", "Claude"],
-                 "b": ["Groq", "Mistral", "OpenRouter", "Gemini", "Claude"]}
+                 "b": ["Claude", "Groq", "Mistral", "OpenRouter", "Gemini"]}
 GEMINI_EXCLUDE = ("embedding", "tts", "image", "audio", "live", "robotics",
                   "computer-use", "aqa", "cyber", "veo", "imagen", "lyria")
 
@@ -147,9 +156,9 @@ def list_models(provider: str, api_key: str):
     return sorted(out, key=lambda x: x[0])
 
 
-def model_picker(label: str, provider: str, key: str):
+def model_picker(label: str, provider: str, key: str, default=None):
     """API에서 목록을 불러와 드롭다운으로 표시. 실패하면 기본값만 표시."""
-    default = PROVIDERS[provider]["model"]
+    default = default or PROVIDERS[provider]["model"]
     err = None
     try:
         options = list_models(provider, secret(PROVIDERS[provider]["key"]))
@@ -346,6 +355,29 @@ def search_disabled_error(e: Exception) -> bool:
     return "web_search" in msg or ("tool" in msg and ("not enabled" in msg or "not supported" in msg))
 
 
+def usage_of(resps) -> dict:
+    """Claude 응답들의 실제 사용량 합계: 입력·출력 토큰과 웹 검색 횟수."""
+    u = {"input": 0, "output": 0, "searches": 0}
+    for r in resps:
+        x = getattr(r, "usage", None)
+        if not x:
+            continue
+        u["input"] += (x.input_tokens or 0) + (getattr(x, "cache_creation_input_tokens", 0) or 0) \
+            + (getattr(x, "cache_read_input_tokens", 0) or 0)
+        u["output"] += x.output_tokens or 0
+        stu = getattr(x, "server_tool_use", None)
+        u["searches"] += (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
+    return u
+
+
+def cost_of(model: str, usage) -> float:
+    """사용량 → 달러. 무료 API나 요금표에 없는 모델은 0."""
+    if not usage or model not in CLAUDE_PRICES:
+        return 0.0
+    pin, pout = CLAUDE_PRICES[model]
+    return (usage["input"] * pin + usage["output"] * pout) / 1_000_000 + usage["searches"] * WEB_SEARCH_PRICE
+
+
 async def call_anthropic(p, model, system, text, images, search=False, on_text=None):
     content = [{"type": "image",
                 "source": {"type": "base64", "media_type": img.mime, "data": b64(img.data)}}
@@ -359,7 +391,8 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                 async for chunk in stream.text_stream:
                     out.append(chunk)
                     on_text(chunk)
-                return "".join(out)
+                final = await stream.get_final_message()
+                return "".join(out), {"usage": usage_of([final])}
     meta = {"sources": [], "searches": 0, "search_note": ""}
     versions = list(CLAUDE_SEARCH_TOOLS) if search else []
     async with AsyncAnthropic(api_key=secret(p["key"])) as client:
@@ -375,10 +408,11 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
                     kwargs["tools"][0].pop("allowed_callers")
             messages = [{"role": "user", "content": content}]
             try:
-                blocks = []
+                blocks, resps = [], []
                 for _ in range(4):        # 서버 도구가 길어지면 pause_turn으로 끊어 오므로 이어서 요청
                     resp = await client.messages.create(model=model, max_tokens=8000, system=system,
                                                         messages=messages, **kwargs)
+                    resps.append(resp)
                     blocks += resp.content
                     if resp.stop_reason != "pause_turn":
                         break
@@ -407,6 +441,7 @@ async def call_anthropic(p, model, system, text, images, search=False, on_text=N
             else:
                 meta["search_note"] = f"웹 검색 오류: {getattr(res, 'error_code', res)}"
     out = "".join(b.text for b in blocks if b.type == "text")
+    meta["usage"] = usage_of(resps)
     return out, meta
 
 
@@ -549,10 +584,12 @@ async def ask(role, name, model, system, text, images, log=None, search=False,
             if isinstance(out, tuple):
                 out, meta = out
             ok = bool(out.strip())
+            usage = meta.get("usage")
             return {"role": role, "name": name, "model": model, "ok": ok,
                     "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1),
                     "sources": meta.get("sources", []), "searches": meta.get("searches", 0),
-                    "search_note": meta.get("search_note", "")}
+                    "search_note": meta.get("search_note", ""),
+                    "usage": usage, "cost": round(cost_of(model, usage), 6)}
         except (asyncio.TimeoutError, TimeoutError):
             return {"role": role, "name": name, "model": model, "ok": False, "timeout": True,
                     "text": f"{timeout}초 안에 응답하지 않았습니다.", "sec": round(time.perf_counter() - t0, 1)}
@@ -745,18 +782,20 @@ def parse_clarify(text: str) -> list:
     return out[:CLARIFY_MAX_Q]
 
 
-async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, log=None) -> list:
+async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, log=None):
     """되물을 질문 목록. 빠르게 끝나도록 허브 AI의 가벼운 모델(예: Haiku)을 먼저 쓰고, 안 되면 허브 모델.
-    실패하면 [] → 되묻지 않고 바로 토론."""
+    실패하면 [] → 되묻지 않고 바로 토론. 반환: (질문 목록, 이 단계 비용 달러)."""
     cands = [m for m in fallbacks(hub, hub_model)[:1] + [hub_model] if not cooled(hub, m, cooldowns)]
+    cost = 0.0
     for m in dict.fromkeys(cands):
         r = await ask("허브 확인", hub, m, CLARIFY_SYSTEM, clarify_prompt(ui), ui.images, log,
                       timeout=CLARIFY_TIMEOUT_SEC, max_wait=QUICK_RETRY_SEC)
+        cost += r.get("cost", 0)
         if r["ok"]:
-            return parse_clarify(r["text"])
+            return parse_clarify(r["text"]), cost
         if r.get("quota"):
             cooldowns[ckey(hub, m)] = cooldown_until(hub, r)
-    return []
+    return [], cost
 
 
 def with_clarification(question: str, answers) -> str:
@@ -778,6 +817,15 @@ def resolve_model(name: str):
         return list_models(name, secret(PROVIDERS[name]["key"]))[0][0]
     except Exception:
         return None
+
+
+def judge_model(name: str, hub: str, hub_model):
+    """판단자의 기본 모델. 허브와 같은 AI면 허브와 다른 낮은 모델(예: Sonnet 허브 → Haiku 판단자)."""
+    if name == hub:
+        low = fallbacks(name, hub_model or "")
+        if low:
+            return low[0]
+    return resolve_model(name)
 
 
 def clock(ts: float) -> str:
@@ -845,6 +893,13 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     판단자가 한도 초과·오류면 아래 순서로 교체 (상호 검토가 유지되는 쪽부터):
       1) 같은 AI의 낮은 모델  2) 다른 AI  3) 허브 AI의 다른 모델(예: Haiku)  4) 허브가 같은 모델로 겸함"""
     board = board or NullBoard()
+    spent = []                                        # 이번 질문에서 성공·실패 상관없이 청구된 비용
+
+    async def tracked_ask(*a, **k):                   # 모든 호출의 비용을 모으는 감싸개
+        r = await ask(*a, **k)
+        spent.append(r.get("cost", 0) or 0)
+        return r
+
     hub = roles["hub"]
     names = {"a": roles["a"], "b": roles["b"]}
     mdl = {"a": models["a"], "b": models["b"]}
@@ -866,9 +921,8 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         for n in available_providers():
             if n not in (cur, other, hub):
                 cands += [(n, m) for m in chain(n, resolve_model(n))]
-        if hub != other:
-            cands += [(hub, m) for m in chain(hub, models["hub"]) if m != models["hub"]]
-            cands.append((hub, models["hub"]))
+        cands += [(hub, m) for m in chain(hub, models["hub"]) if m != models["hub"]]
+        cands.append((hub, models["hub"]))             # 최후: 허브가 같은 모델로 겸함
         for n, m in cands:
             if (m and (n, m) not in tried[slot] and (n, m) != (other, mdl[other_slot[slot]])
                     and not cooled(n, m, cooldowns)):
@@ -915,10 +969,11 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         end = time.perf_counter() + judge_timeout
 
         def call(limit):
-            return ask(label, names[slot], mdl[slot], system, make(limit), imgs, log,
+            return tracked_ask(label, names[slot], mdl[slot], system, make(limit), imgs, log,
                        timeout=max(end - time.perf_counter(), 1), max_wait=QUICK_RETRY_SEC)
 
-        board.start(key, names[slot] if mdl[slot] == prim[slot] else f"{names[slot]} · {short(mdl[slot])}")
+        board.start(key, names[slot] if mdl[slot] == prim[slot] and names[slot] != hub
+                    else f"{names[slot]} · {short(mdl[slot])}")
         r = await call(limit_of(names[slot]))
         shrunk = False
         while not r["ok"]:
@@ -964,7 +1019,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
     for i, hm in enumerate(hub_models):
         board.start("brief", hub if hm == models["hub"] else f"{hub} · {short(hm)}",
                     "필요하면 웹 검색" if search else "")
-        brief_res = await ask("허브 정리", hub, hm, HUB_BRIEF_SYSTEM, brief_prompt(ui, search),
+        brief_res = await tracked_ask("허브 정리", hub, hm, HUB_BRIEF_SYSTEM, brief_prompt(ui, search),
                               imgs, log, search=search)
         board.done("brief", brief_res)
         if brief_res["ok"] or not brief_res.get("quota") or i == len(hub_models) - 1:
@@ -1017,7 +1072,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
         is_hub_model = (name, model) == (hub, models["hub"])
         board.start("verdict", name if is_hub_model else f"{name} · {short(model)}",
                     "" if is_hub_model else "허브 대신 판정")
-        final = await ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log,
+        final = await tracked_ask("최종 판정", name, model, HUB_VERDICT_SYSTEM, vp, imgs, log,
                           on_text=getattr(board, "stream", None))
         board.done("verdict", final)
         if final["ok"]:
@@ -1033,7 +1088,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
             "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0),
-            "fast": fast}
+            "fast": fast, "cost": round(sum(spent), 6)}
 
 
 # ───────────────────────── 4) 대화 기록 저장소 ─────────────────────────
@@ -1114,7 +1169,8 @@ class ConversationStore:
         self._write(f"conversations/{conv['id']}.json", conv, f"대화 저장: {conv['title']}")
         idx = self._read("index.json") or {}
         idx[conv["id"]] = {"title": conv["title"], "created": conv["created"],
-                           "updated": conv["updated"], "turns": len(conv["turns"])}
+                           "updated": conv["updated"], "turns": len(conv["turns"]),
+                           "cost": conv.get("cost", {})}          # {"2026-11": 달러} 월별 Claude 비용
         self._write("index.json", idx, f"목록 갱신: {conv['title']}")
 
     def delete(self, cid):
@@ -1287,9 +1343,13 @@ def save_conversation():
     if not ss.conv_id:
         ss.conv_id = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d-%H%M%S-") + pysecrets.token_hex(2)
         ss.conv_created = now_text()
+    monthly = {}
+    for t in ss.turns:                      # 비용 기록이 생기기 전의 질문은 at·cost가 없어 빠짐
+        if t.get("at") and t["result"].get("cost"):
+            monthly[t["at"][:7]] = round(monthly.get(t["at"][:7], 0) + t["result"]["cost"], 6)
     conv = {"id": ss.conv_id, "title": ss.turns[0]["q"][:40], "created": ss.conv_created,
             "updated": now_text(), "turns": ss.turns, "docs": ss.conv_docs,
-            "files": ss.conv_files, "images": len(ss.conv_images) + ss.img_count}
+            "files": ss.conv_files, "images": len(ss.conv_images) + ss.img_count, "cost": monthly}
     store.save(conv)
     ss.pop("history_cache", None)
 
@@ -1323,7 +1383,7 @@ with st.sidebar:
     summary = st.empty()
     with st.expander("⚙️ 역할·모델 설정"):
         hub = st.selectbox("허브 (정리·판정)", avail, index=avail.index(pick_default("hub", avail)), key="r_hub")
-        judge_pool = [n for n in avail if n != hub] if len(avail) >= 3 else avail
+        judge_pool = avail                # 허브와 같은 AI도 판단자 가능 (다른 모델을 씀, 예: Haiku)
         c1, c2 = st.columns(2)
         a = c1.selectbox("판단 A", judge_pool, index=judge_pool.index(pick_default("a", judge_pool)), key="r_a")
         b_pool = [n for n in judge_pool if n != a] or judge_pool
@@ -1352,10 +1412,11 @@ with st.sidebar:
         pick_models = st.checkbox("모델 직접 고르기", key="r_pick",
                                   help="끄면 Secrets에 지정한 기본 모델을 씁니다.")
         if pick_models:
+            hub_m = model_picker(f"허브 · {hub}", hub, f"m_hub_{hub}")
             models = {
-                "hub": model_picker(f"허브 · {hub}", hub, f"m_hub_{hub}"),
-                "a": model_picker(f"판단 A · {a}", a, f"m_a_{a}"),
-                "b": model_picker(f"판단 B · {b}", b, f"m_b_{b}"),
+                "hub": hub_m,
+                "a": model_picker(f"판단 A · {a}", a, f"m_a_{a}", judge_model(a, hub, hub_m)),
+                "b": model_picker(f"판단 B · {b}", b, f"m_b_{b}", judge_model(b, hub, hub_m)),
             }
             if st.button("🔄 모델 목록 새로고침", use_container_width=True):
                 list_models.clear()
@@ -1363,9 +1424,13 @@ with st.sidebar:
                 missing_models().clear()
                 st.rerun()
         else:
-            models = {"hub": resolve_model(hub), "a": resolve_model(a), "b": resolve_model(b)}
-        if hub in (a, b):
-            st.caption("키가 2개뿐이라 허브가 판단자를 겸합니다.")
+            hub_m = resolve_model(hub)
+            models = {"hub": hub_m, "a": judge_model(a, hub, hub_m), "b": judge_model(b, hub, hub_m)}
+        for who, n in (("A", a), ("B", b)):
+            if n == hub and models[who.lower()] == models["hub"]:
+                st.caption(f"⚠️ 판단 {who}가 허브와 같은 모델이라 상호 검토 효과가 줄어듭니다.")
+            elif n == hub:
+                st.caption(f"판단 {who}는 허브와 같은 {n}의 다른 모델({short(models[who.lower()])})을 씁니다.")
         steps = []
         for who, n in (("A", a), ("B", b)):
             low = fallbacks(n, models[who.lower()] or "")
@@ -1377,7 +1442,9 @@ with st.sidebar:
             if n in (a, b):
                 st.caption(f"⚠️ {n} 모델 목록을 불러오지 못해 추정한 이름으로 교체합니다 ({why})")
     calls = 4 if fast else 6
-    summary.caption(f"🔮 {hub} 주재 · ⚖️ {a} vs {b}"
+    def tag(n, m):
+        return f"{n}({short(m).replace('claude-', '')})" if n == hub else n
+    summary.caption(f"🔮 {hub} 주재 · ⚖️ {tag(a, models['a'])} vs {tag(b, models['b'])}"
                     + (" · 🔎" if web_search else "") + (" · ❓" if clarify_on else "")
                     + (" · ⚡" if fast else "") + f" · 호출 {calls}회")
 
@@ -1388,6 +1455,15 @@ with st.sidebar:
         if st.button("제외 해제", use_container_width=True):
             cooldowns.clear()
             st.rerun()
+
+    # 이번 달 Claude 비용 (저장된 대화 기록 기준 추정)
+    month = datetime.now(ZoneInfo(secret("APP_TIMEZONE", "Asia/Seoul"))).strftime("%Y-%m")
+    budget = float(secret("CLAUDE_MONTHLY_BUDGET", 150))
+    spent_month = sum((c.get("cost") or {}).get(month, 0) for c in conversation_list())
+    st.progress(min(spent_month / budget, 1.0) if budget else 0.0,
+                text=f"💰 이번 달 Claude 약 ${spent_month:.2f} / ${budget:.0f}")
+    st.caption("이 앱의 대화 기록으로 계산한 추정치입니다 (삭제한 대화는 빠짐). "
+               "정확한 금액은 console.anthropic.com에서 확인하세요.")
 
     st.divider()
     st.markdown("**📚 대화 기록**")
@@ -1449,7 +1525,8 @@ def render_result(res):
         st.markdown("##### 📜 Majority Report")
         st.markdown(major)
         st.caption(f"최종 판정: {final['name']} · {final['sec']}초"
-                   + (f" · 웹 검색 {res['searches']}회" if res.get("searches") else ""))
+                   + (f" · 웹 검색 {res['searches']}회" if res.get("searches") else "")
+                   + (f" · 💰 Claude 약 ${res['cost']:.3f}" if res.get("cost") else ""))
         if res.get("sources"):
             with st.expander(f"🔎 허브가 확인한 출처 ({len(res['sources'])}개)"):
                 for src in res["sources"]:
@@ -1494,8 +1571,8 @@ def make_input(question, answers=()):
                      images=ss.conv_images, history=history_pairs())
 
 
-def run_turn(question, files, warns, answers):
-    """토론 실행 → 결과 표시 → 저장."""
+def run_turn(question, files, warns, answers, extra_cost=0.0):
+    """토론 실행 → 결과 표시 → 저장. extra_cost: 되묻기 단계에서 쓴 비용."""
     ui = make_input(question, answers)
     with st.chat_message("assistant", avatar="🔮"):
         for w in warns:
@@ -1526,8 +1603,10 @@ def run_turn(question, files, warns, answers):
                 status.update(label="실패", state="error")
                 st.error(str(e))
         if result:
+            result["cost"] = round(result.get("cost", 0) + extra_cost, 6)
             render_result(result)
-            ss.turns.append({"q": question, "clarify": list(answers), "files": files, "result": result})
+            ss.turns.append({"q": question, "clarify": list(answers), "files": files, "result": result,
+                             "at": now_text()})
             try:
                 save_conversation()
             except Exception as e:
@@ -1571,16 +1650,17 @@ if msg and (msg.text.strip() or msg.files):
         st.error("모델이 선택되지 않은 역할이 있습니다. 사이드바의 모델 선택을 확인하세요.")
         st.stop()
 
-    questions = []
+    questions, clarify_cost = [], 0.0
     if clarify_on:
         with st.chat_message("assistant", avatar="🔮"):
             with st.spinner("허브가 질문을 확인하는 중…"):
-                questions = asyncio.run(hub_clarify(make_input(question), hub, models["hub"], cooldowns))
+                questions, clarify_cost = asyncio.run(
+                    hub_clarify(make_input(question), hub, models["hub"], cooldowns))
     if questions:                         # 화면을 다시 그려 선택형 질문을 보여줌
         ss.pending = {"id": pysecrets.token_hex(3), "q": question, "files": new_names,
-                      "warns": warns, "questions": questions}
+                      "warns": warns, "questions": questions, "cost": clarify_cost}
         st.rerun()
-    run_turn(question, new_names, warns, [])
+    run_turn(question, new_names, warns, [], clarify_cost)
 
 elif ss.get("pending"):
     pend = ss.pending
@@ -1619,4 +1699,4 @@ elif ss.get("pending"):
                 with st.chat_message("user"):
                     for a in answers:
                         st.caption(f"❓ {a['q']} → **{a['a']}**")
-        run_turn(pend["q"], pend["files"], pend["warns"], answers)
+        run_turn(pend["q"], pend["files"], pend["warns"], answers, pend.get("cost", 0.0))
