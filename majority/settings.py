@@ -82,6 +82,17 @@ CLAUDE_PRICES = {
 
 WEB_SEARCH_PRICE = 10 / 1000                 # Claude 웹 검색 1회 (1,000회당 10달러)
 
+# Gemini Developer API Standard 유료 단가 (USD/100만 토큰: 입력, 출력+생각, 캐시 입력).
+# https://ai.google.dev/gemini-api/docs/pricing (2026-11-08 확인)
+# 3.8 Flash의 출시 할인은 2026-12-31까지. 별칭은 API가 반환한 실제 모델로 계산.
+GEMINI_PRICES = {
+    "gemini-3.8-flash": (0.75, 3.75, 0.075),
+    "gemini-3.5-flash": (1.50, 9.00, 0.15),
+    "gemini-3.5-flash-lite": (0.30, 2.50, 0.03),
+    "gemini-2.5-flash": (0.30, 2.50, 0.03),
+    "gemini-2.5-flash-lite": (0.10, 0.40, 0.01),
+}
+
 
 IMAGE_MIME = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",

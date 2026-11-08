@@ -20,7 +20,8 @@ def test_usage_and_cost(core):
     assert u == {"input": 15000, "output": 3000, "searches": 2}
     assert core.cost_of("claude-sonnet-5-5", u) == pytest.approx((15000 * 2 + 3000 * 10) / 1e6 + 0.02)
     assert core.cost_of("claude-haiku-5-5", {"input": 10000, "output": 2000, "searches": 0}) == pytest.approx(0.002)
-    assert core.cost_of("gemini-3.8-flash", u) == 0 and core.cost_of("claude-sonnet-5-5", None) == 0
+    assert core.cost_of("gemini-3.8-flash", u) == pytest.approx((15000 * .75 + 3000 * 3.75) / 1e6)
+    assert core.cost_of("claude-sonnet-5-5", None) == 0
 
 
 def test_judge_model_on_hub_provider_is_lower_model(core):
@@ -33,7 +34,9 @@ def test_turn_cost_and_haiku_judge(core, run, ai):
     assert r["firsts"][1]["model"] == "claude-haiku-5-5" and not r["notices"]
     u = {**ai.usage, "searches": 0}
     expected = 2 * core.cost_of("claude-sonnet-5-5", u) + 0.01 + 2 * core.cost_of("claude-haiku-5-5", u)
-    assert r["cost"] == pytest.approx(expected)
+    assert r["costs"]["Claude"] == pytest.approx(expected)
+    assert r["costs"]["Gemini"] == pytest.approx(2 * core.cost_of("gemini-3.8-flash", u), abs=1e-6)
+    assert r["cost"] == pytest.approx(sum(r["costs"].values()), abs=2e-6)
 
 
 def test_free_judge_exhausted_never_duplicates_haiku(run, ai):
@@ -100,3 +103,93 @@ def test_pretty_model_names(core):
     assert core.pretty("gemini-3.8-flash") == "Gemini 3.8 Flash"
     assert core.pretty("openai/gpt-oss-120b") == "gpt-oss-120b"
     assert core.pretty("") == ""
+
+
+def test_gemini_thinking_cache_and_price_transition(core):
+    usage = core.gemini_usage(NS(usage_metadata=NS(prompt_token_count=10000,
+        candidates_token_count=500, thoughts_token_count=1500, cached_content_token_count=4000)))
+    assert usage == {"input": 10000, "output": 2000, "cached_input": 4000, "searches": 0}
+    core["today"] = lambda: "2026-12-31"
+    assert core.cost_of("gemini-3.8-flash", usage) == pytest.approx((6000*.75 + 4000*.075 + 2000*3.75)/1e6)
+    core["today"] = lambda: "2027-01-01"
+    assert core.cost_of("gemini-3.8-flash", usage) == pytest.approx((6000*1.5 + 4000*.15 + 2000*7.5)/1e6)
+    old_secret = core.secret
+    core["secret"] = lambda k, d=None: False if k == "GEMINI_PAID_TIER" else old_secret(k, d)
+    assert core.cost_of("gemini-3.8-flash", usage) == 0
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_gemini_sdk_usage_and_alias(core, monkeypatch, streaming):
+    """일반·스트리밍 usage, 생각 토큰, 별칭 모델의 실제 단가를 SDK 경계에서 확인."""
+    def response(text, output):
+        return NS(text=text, candidates=None, model_version="gemini-3.8-flash",
+                  usage_metadata=NS(prompt_token_count=1000, candidates_token_count=output,
+                                    thoughts_token_count=100, cached_content_token_count=200))
+
+    class Models:
+        async def generate_content(self, **kw):
+            return response("완성", 200)
+
+        async def generate_content_stream(self, **kw):
+            async def chunks():
+                yield response("완", 50)
+                yield response("성", 200)
+            return chunks()
+
+    monkeypatch.setattr(core.genai, "Client", lambda **kw: NS(aio=NS(models=Models())))
+    chunks = []
+    core["CALLERS"]["gemini"] = core.call_gemini
+    r = asyncio.run(core.ask("판정", "Gemini", "gemini-flash-latest", "sys", "q", [],
+                            on_text=chunks.append if streaming else None))
+    assert r["ok"] and r["text"] == "완성"
+    assert r["usage"] == {"input": 1000, "output": 300, "cached_input": 200, "searches": 0}
+    assert r["billing_model"] == "gemini-3.8-flash" and not r["cost_note"]
+    assert r["cost"] == pytest.approx((800*.75 + 200*.075 + 300*3.75)/1e6)
+    if streaming:
+        assert chunks == [None, "완", "성"]
+
+
+def test_unknown_gemini_price_is_reported(core):
+    async def unknown(*a, **kw):
+        return "응답", {"usage": {"input": 1000, "output": 100, "searches": 0}}
+    core.CALLERS["gemini"] = unknown
+    r = asyncio.run(core.ask("판단", "Gemini", "gemini-unknown", "sys", "q", []))
+    assert r["ok"] and "단가가 없어" in r["cost_note"]
+
+
+def test_monthly_totals_preserve_old_claude_records(core):
+    old = {"cost": {"2026-11": .25, "2026-10": 3}}
+    new = {"cost": {"2026-11": .15},
+           "cost_by_provider": {"Claude": {"2026-11": .1}, "Gemini": {"2026-11": .05}}}
+    assert core.monthly_costs([old, new], "2026-11") == pytest.approx({"Claude": .35, "Gemini": .05})
+    assert core.result_costs({"cost": .25}) == {"Claude": .25, "Gemini": 0}
+
+
+def test_pipeline_updates_live_provider_costs(core, run):
+    class Board(core.NullBoard):
+        def __init__(self):
+            self.updates = []
+        def update_cost(self, costs):
+            self.updates.append(dict(costs))
+    board = Board()
+    r = run(ROLES, MODELS_AB, board=board)
+    assert len(board.updates) == 6
+    assert board.updates[-1] == r["costs"]
+    assert r["costs"]["Claude"] > 0 and r["costs"]["Gemini"] > 0
+
+
+def test_clarify_cost_is_attributed_to_gemini(core, ai):
+    core["fallbacks"] = lambda name, model: []
+    details = {}
+    _, cost = asyncio.run(core.hub_clarify(core.UserInput(prompt="q"), "Gemini",
+                                         "gemini-3.8-flash", {}, cost_details=details))
+    assert cost > 0 and details == {"Gemini": cost}
+
+
+def test_claude_cache_rates_and_long_haiku(core):
+    usage = {"input": 10000, "output": 1000, "searches": 0,
+             "cache_read": 3000, "cache_write": 2000, "cache_write_1h": 1000}
+    expected = (5000*2 + 3000*.1 + 1000*2.5 + 1000*4 + 1000*10)/1e6
+    assert core.cost_of("claude-sonnet-5-5", usage) == pytest.approx(expected)
+    assert core.cost_of("claude-haiku-5-5", {"input": 100001, "output": 2000, "searches": 0}) == pytest.approx(
+        (100001*.5 + 2000*2.5)/1e6)

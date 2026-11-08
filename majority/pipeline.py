@@ -10,7 +10,7 @@ from majority.llm import *  # noqa: F401,F403
 from majority.prompts import *  # noqa: F401,F403
 
 
-async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, log=None):
+async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, log=None, cost_details=None):
     """되물을 질문 목록. 빠르게 끝나도록 허브 AI의 가벼운 모델(예: Haiku)을 먼저 쓰고, 안 되면 허브 모델.
     실패하면 [] → 되묻지 않고 바로 토론. 반환: (질문 목록, 이 단계 비용 달러)."""
     cands = [m for m in fallbacks(hub, hub_model)[:1] + [hub_model] if not cooled(hub, m, cooldowns)]
@@ -20,6 +20,10 @@ async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, 
                       effort=CLAUDE_EFFORT["clarify"],
                       timeout=CLARIFY_TIMEOUT_SEC, max_wait=QUICK_RETRY_SEC)
         cost += r.get("cost", 0)
+        if cost_details is not None:
+            cost_details[hub] = round(cost_details.get(hub, 0) + r.get("cost", 0), 6)
+            if r.get("cost_note") and log:
+                log(r["cost_note"])
         if r["ok"]:
             return parse_clarify(r["text"]), cost
         if r.get("quota"):
@@ -75,10 +79,18 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
       1) 같은 AI의 낮은 모델  2) 다른 AI  3) 허브 AI의 다른 모델(예: Haiku)  4) 허브가 같은 모델로 겸함"""
     board = board or NullBoard()
     spent = []                                        # 이번 질문에서 성공·실패 상관없이 청구된 비용
+    costs = {"Claude": 0.0, "Gemini": 0.0}
 
     async def tracked_ask(*a, **k):                   # 모든 호출의 비용을 모으고, 잘린 답은 알림
         r = await ask(*a, **k)
         spent.append(r.get("cost", 0) or 0)
+        name = r["name"]
+        if name in costs:
+            costs[name] = round(costs[name] + (r.get("cost", 0) or 0), 6)
+        if r.get("cost_note"):
+            note("💰 " + r["cost_note"])
+        if hasattr(board, "update_cost"):
+            board.update_cost(costs)
         if r.get("ok") and r.get("truncated"):
             note(f"✂️ {r['role']}({r['name']})의 답이 최대 길이에 닿아 끝부분이 잘렸을 수 있습니다.")
         return r
@@ -271,7 +283,7 @@ async def run_pipeline(ui: UserInput, roles: dict, models: dict, log, cooldowns:
 
     return {"brief": brief_res, "firsts": [fa, fb], "debates": debates, "final": final,
             "notices": notices, "sources": sources, "searches": brief_res.get("searches", 0),
-            "fast": fast, "cost": round(sum(spent), 6)}
+            "fast": fast, "cost": round(sum(spent), 6), "costs": costs}
 
 
 async def run_with_ticker(job, render, interval: float = 1.0):

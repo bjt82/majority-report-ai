@@ -27,7 +27,7 @@ async def _mock(p, model, system, text, images, search=False, on_text=None, effo
         on_text(out)
     if p["kind"] == "anthropic":
         return out, {{"usage": {{"input": 10000, "output": 2000, "searches": 1 if search else 0}}}}
-    return out if p["kind"] == "openai" else (out, {{}})
+    return out if p["kind"] == "openai" else (out, {{"usage": {{"input": 10000, "output": 2000, "cached_input": 0, "searches": 0}}}})
 
 
 def _model_ids(provider):
@@ -101,6 +101,9 @@ def test_default_roles_and_cost(mock_app, tmp_path):
     turn = at.session_state["turns"][0]
     assert turn["result"]["firsts"][1]["model"] == "claude-haiku-5-5"
     expected = 2 * (10000 * 2 + 2000 * 10) / 1e6 + 0.01 + 2 * (10000 * 0.1 + 2000 * 0.5) / 1e6
+    claude_expected = expected
+    gemini_expected = 2 * (10000 * .75 + 2000 * 3.75) / 1e6
+    expected += gemini_expected
     assert turn["result"]["cost"] == pytest.approx(expected) and turn.get("at")
     assert any("💰 Claude 약 $" in c.value for c in at.caption)
     index = tmp_path / "data" / "index.json"          # 저장은 뒤에서 하므로 잠깐 기다림
@@ -110,6 +113,11 @@ def test_default_roles_and_cost(mock_app, tmp_path):
         time.sleep(0.1)
     idx = json.loads(index.read_text(encoding="utf-8"))
     assert next(iter(idx.values()))["cost"][turn["at"][:7]] == pytest.approx(expected)
+    assert turn["result"]["costs"] == pytest.approx({"Claude": claude_expected, "Gemini": gemini_expected})
+    entry = next(iter(idx.values()))
+    assert entry["cost_by_provider"]["Gemini"][turn["at"][:7]] == pytest.approx(gemini_expected)
+    assert any("이번 달 Gemini" in p.proto.text for p in at.sidebar.get("progress"))
+    assert any("Gemini 약 $0.0300" in c.value for c in at.caption)
 
 
 # ── 되묻기 ──

@@ -33,17 +33,90 @@ def usage_of(resps) -> dict:
         u["input"] += (x.input_tokens or 0) + (getattr(x, "cache_creation_input_tokens", 0) or 0) \
             + (getattr(x, "cache_read_input_tokens", 0) or 0)
         u["output"] += x.output_tokens or 0
+        for key, attr in (("cache_read", "cache_read_input_tokens"),
+                          ("cache_write", "cache_creation_input_tokens")):
+            value = getattr(x, attr, 0) or 0
+            if value:
+                u[key] = u.get(key, 0) + value
+        cache = getattr(x, "cache_creation", None)
+        hour = getattr(cache, "ephemeral_1h_input_tokens", 0) or 0
+        if hour:
+            u["cache_write_1h"] = u.get("cache_write_1h", 0) + hour
         stu = getattr(x, "server_tool_use", None)
         u["searches"] += (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
     return u
 
 
 def cost_of(model: str, usage) -> float:
-    """사용량 → 달러. 무료 API나 요금표에 없는 모델은 0."""
-    if not usage or model not in CLAUDE_PRICES:
+    """사용량 → 달러. 미등록 단가는 별도 cost_note로 알리고 합계에서는 제외."""
+    if not usage:
+        return 0.0
+    if model.startswith("gemini-"):
+        prices = gemini_prices(model)
+        if prices is None or not secret("GEMINI_PAID_TIER", True):
+            return 0.0
+        pin, pout, pcache = prices
+        cached = min(usage.get("cached_input", 0), usage["input"])
+        return ((usage["input"] - cached) * pin + cached * pcache + usage["output"] * pout) / 1_000_000
+    if model not in CLAUDE_PRICES:
         return 0.0
     pin, pout = CLAUDE_PRICES[model]
-    return (usage["input"] * pin + usage["output"] * pout) / 1_000_000 + usage["searches"] * WEB_SEARCH_PRICE
+    if model == "claude-haiku-5-5" and usage["input"] > 100_000:
+        pin, pout = 0.50, 2.50
+    read, write = usage.get("cache_read", 0), usage.get("cache_write", 0)
+    hour = min(usage.get("cache_write_1h", 0), write)
+    read_factor = 0.05 if model in ("claude-sonnet-5-5", "claude-opus-5-5") else 0.1
+    input_cost = (usage["input"] - read - write) * pin + read * pin * read_factor
+    input_cost += (write - hour) * pin * 1.25 + hour * pin * 2
+    return (input_cost + usage["output"] * pout) / 1_000_000 + usage["searches"] * WEB_SEARCH_PRICE
+
+
+def gemini_prices(model):
+    """확인된 모델 또는 Secrets의 명시적 단가만 사용. 모르는 별칭은 추정하지 않음."""
+    custom = secret("GEMINI_PRICES", {})
+    if model in custom:
+        try:
+            rates = tuple(float(x) for x in custom[model])
+            if len(rates) == 3 and all(0 <= x < float("inf") for x in rates):
+                return rates
+        except (TypeError, ValueError):
+            pass
+        return None
+    if model == "gemini-3.8-flash" and today() >= "2027-01-01":
+        return (1.50, 7.50, 0.15)
+    return GEMINI_PRICES.get(model)
+
+
+def gemini_usage(resp):
+    u = getattr(resp, "usage_metadata", None)
+    if u is None:
+        return None
+    return {"input": getattr(u, "prompt_token_count", 0) or 0,
+            "output": (getattr(u, "candidates_token_count", 0) or 0)
+                      + (getattr(u, "thoughts_token_count", 0) or 0),
+            "cached_input": getattr(u, "cached_content_token_count", 0) or 0,
+            "searches": 0}
+
+
+def result_costs(result):
+    """예전 기록의 cost는 Claude만 포함. 새 기록은 공급자별 합계를 유지."""
+    return result.get("costs") or {"Claude": result.get("cost", 0), "Gemini": 0}
+
+
+def monthly_costs(conversations, month):
+    totals = {"Claude": 0.0, "Gemini": 0.0}
+    for c in conversations:
+        if "cost_by_provider" in c:
+            for name in totals:
+                totals[name] += c["cost_by_provider"].get(name, {}).get(month, 0)
+        else:
+            totals["Claude"] += (c.get("cost") or {}).get(month, 0)
+    return totals
+
+
+def cost_caption(costs):
+    return (f"Claude 약 ${costs.get('Claude', 0):.4f} · Gemini 약 ${costs.get('Gemini', 0):.4f}"
+            f" · 합계 약 ${sum(costs.values()):.4f}")
 
 
 def effort_rejected(e: Exception) -> bool:
@@ -152,12 +225,18 @@ async def call_gemini(p, model, system, text, images, search=False, on_text=None
     async def run(cfg):
         if on_text:
             out = []
+            last_usage, resolved_model = None, model
             async for chunk in await client.aio.models.generate_content_stream(
                     model=model, contents=parts, config=cfg):
+                # 스트림 usage는 누적값이므로 더하지 않고 마지막 값만 보관.
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    last_usage = chunk.usage_metadata
+                resolved_model = getattr(chunk, "model_version", None) or resolved_model
                 if chunk.text:
                     out.append(chunk.text)
                     on_text(chunk.text)
-            return SimpleNamespace(text="".join(out), candidates=None)
+            return SimpleNamespace(text="".join(out), candidates=None,
+                                   usage_metadata=last_usage, model_version=resolved_model)
         return await client.aio.models.generate_content(model=model, contents=parts, config=cfg)
 
     use_search, use_thinking = search, True
@@ -182,6 +261,10 @@ async def call_gemini(p, model, system, text, images, search=False, on_text=None
             for ch in gm.grounding_chunks or []:
                 if ch.web and ch.web.uri:
                     meta["sources"].append({"title": ch.web.title or ch.web.uri, "url": ch.web.uri})
+    meta["usage"] = gemini_usage(resp)
+    meta["billing_model"] = getattr(resp, "model_version", None) or model
+    if use_search:
+        meta["cost_note"] = "Gemini 검색 요금은 무료 허용량에 따라 달라 토큰 비용만 계산했습니다."
     return resp.text or "", meta
 
 
@@ -276,11 +359,21 @@ async def ask(role, name, model, system, text, images, log=None, search=False,
                 out, meta = out
             ok = bool(out.strip())
             usage = meta.get("usage")
+            billing_model = meta.get("billing_model", model)
+            cost_note = meta.get("cost_note", "")
+            if name in ("Claude", "Gemini") and ok:
+                if usage is None:
+                    cost_note = f"{name} 사용량을 받지 못해 일부 비용을 계산하지 못했습니다."
+                elif name == "Gemini" and secret("GEMINI_PAID_TIER", True) and gemini_prices(billing_model) is None:
+                    cost_note = f"Gemini {billing_model} 단가가 없어 일부 비용을 계산하지 못했습니다."
+                elif name == "Claude" and billing_model not in CLAUDE_PRICES:
+                    cost_note = f"Claude {billing_model} 단가가 없어 일부 비용을 계산하지 못했습니다."
             return {"role": role, "name": name, "model": model, "ok": ok,
                     "text": out if ok else "빈 응답", "sec": round(time.perf_counter() - t0, 1),
                     "sources": meta.get("sources", []), "searches": meta.get("searches", 0),
                     "search_note": meta.get("search_note", ""),
-                    "usage": usage, "cost": round(cost_of(model, usage), 6),
+                    "usage": usage, "billing_model": billing_model, "cost_note": cost_note,
+                    "cost": round(cost_of(billing_model, usage), 6),
                     "truncated": bool(meta.get("truncated"))}
         except (asyncio.TimeoutError, TimeoutError):
             return {"role": role, "name": name, "model": model, "ok": False, "timeout": True,
