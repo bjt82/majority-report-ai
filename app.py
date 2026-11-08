@@ -53,6 +53,9 @@ SEARCH_MAX_USES = 3                          # 허브가 질문 하나에 웹 �
 CLAUDE_SEARCH_TOOLS = ("web_search_20260318", "web_search_20250305")   # 최신 → 예전 버전 순으로 시도
 COOLDOWN_MIN_SEC = 10 * 60                   # 분당 한도 초과 시 그 모델을 자동 제외하는 시간 (대기 시간을 모를 때)
 COOLDOWN_DAY_SEC = 60 * 60                   # 일일 한도 초과로 보일 때 그 모델을 자동 제외하는 시간
+CLARIFY_TIMEOUT_SEC = 30                     # 허브가 되물을 것을 판단하는 단계의 최대 대기
+CLARIFY_MAX_Q = 3                            # 한 번에 되묻는 질문 최대 개수
+CLARIFY_MAX_OPTS = 5                         # 질문 하나의 선택지 최대 개수
 MAX_HISTORY_TURNS = 6                        # 후속 질문 때 함께 보낼 이전 대화 수
 LATEST_ANSWER_CHARS = 12_000                 # 직전 최종안은 거의 전부 전달
 OLDER_ANSWER_CHARS = 3_000                   # 그 이전 최종안은 요약 분량만
@@ -669,6 +672,81 @@ def split_report(text: str):
     return text.strip(), ""
 
 
+# ───────────────────────── 되묻기: 토론 전에 허브가 사용자에게 확인 ─────────────────────────
+CLARIFY_SYSTEM = (
+    "당신은 토론을 주재하는 허브 AI입니다. 지금은 답을 내는 단계가 아니라, 두 판단자에게 질문을 넘기기 전에 "
+    "사용자에게 꼭 되물어야 할 것이 있는지만 판단하는 단계입니다. 반드시 JSON 하나만 출력하세요."
+)
+
+
+def clarify_prompt(ui: UserInput) -> str:
+    return f"""{ui.base_text()}
+
+위 질문을 두 AI가 토론해 답하기 전에, 사용자에게 먼저 확인해야 할 것이 있는지 판단하세요.
+되물을 때:
+- 질문이 여러 뜻으로 읽혀 답이 크게 달라지는 경우 (대상·범위·기간·지역·기준·수준 등이 빠짐)
+- 사용자의 상황·목적·선호에 따라 좋은 답이 크게 달라지는 경우
+되묻지 말 때:
+- 이전 대화나 첨부 자료로 이미 알 수 있는 것
+- 상식적으로 합리적인 가정을 할 수 있어 답이 크게 달라지지 않는 것
+- 사실 확인처럼 허브가 웹 검색으로 직접 알아낼 수 있는 것
+꼭 필요할 때만 묻고, 애매하면 묻지 말고 진행하세요.
+
+아래 JSON 형식으로만 답하세요. 설명이나 코드 블록 표시는 쓰지 마세요.
+{{"ask": true, "questions": [{{"q": "사용자에게 물을 질문", "options": ["선택지1", "선택지2"], "multi": false}}]}}
+- 질문은 최대 {CLARIFY_MAX_Q}개, 질문마다 선택지 2~{CLARIFY_MAX_OPTS}개. 선택지는 짧고 서로 겹치지 않게.
+- 여러 개를 함께 고를 수 있는 질문이면 "multi": true.
+- '기타'나 '직접 입력' 선택지는 넣지 마세요. 화면에서 따로 제공합니다.
+- 사용자의 질문과 같은 언어로 쓰세요.
+- 물을 것이 없으면 {{"ask": false, "questions": []}}"""
+
+
+def parse_clarify(text: str) -> list:
+    """허브의 JSON 답을 [{'q', 'options', 'multi'}, ...]로. 형식이 깨졌으면 [] (되묻지 않고 진행)."""
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict) or not data.get("ask"):
+        return []
+    out = []
+    for q in data.get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        question = str(q.get("q", "")).strip()
+        opts = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()]
+        opts = [o for o in dict.fromkeys(opts) if o not in ("기타", "직접 입력", "기타(직접 입력)")]
+        if question and len(opts) >= 2:
+            out.append({"q": question, "options": opts[:CLARIFY_MAX_OPTS], "multi": bool(q.get("multi"))})
+    return out[:CLARIFY_MAX_Q]
+
+
+async def hub_clarify(ui: UserInput, hub: str, hub_model: str, cooldowns: dict, log=None) -> list:
+    """되물을 질문 목록. 빠르게 끝나도록 허브 AI의 가벼운 모델(예: Haiku)을 먼저 쓰고, 안 되면 허브 모델.
+    실패하면 [] → 되묻지 않고 바로 토론."""
+    cands = [m for m in fallbacks(hub, hub_model)[:1] + [hub_model] if not cooled(hub, m, cooldowns)]
+    for m in dict.fromkeys(cands):
+        r = await ask("허브 확인", hub, m, CLARIFY_SYSTEM, clarify_prompt(ui), ui.images, log,
+                      timeout=CLARIFY_TIMEOUT_SEC, max_wait=QUICK_RETRY_SEC)
+        if r["ok"]:
+            return parse_clarify(r["text"])
+        if r.get("quota"):
+            cooldowns[ckey(hub, m)] = cooldown_until(hub, r)
+    return []
+
+
+def with_clarification(question: str, answers) -> str:
+    """사용자가 고른 답을 질문 뒤에 붙임. 판단자·허브 모두 이 내용을 보고 토론함."""
+    if not answers:
+        return question
+    lines = "\n".join(f"- {a['q']} → {a['a']}" for a in answers)
+    return (f"{question}\n\n<clarification>\n(허브가 되물어 사용자가 직접 답한 내용입니다. 이 조건에 맞춰 답하세요.)\n"
+            f"{lines}\n</clarification>")
+
+
 # ───────────────────────── 3) 파이프라인 ─────────────────────────
 def resolve_model(name: str):
     """대타로 투입할 AI의 모델: Secrets 기본값, 없으면 목록의 첫 모델."""
@@ -1163,7 +1241,7 @@ ss.setdefault("img_count", 0)     # 지난 대화에서 쓴 이미지 수 (이�
 store = ConversationStore()
 
 NEW_CONV_KEYS = ("turns", "conv_docs", "conv_images", "conv_files", "conv_id", "conv_created",
-                 "img_count", "history_cache")
+                 "img_count", "history_cache", "pending")
 
 
 def reset_conversation():
@@ -1233,6 +1311,9 @@ with st.sidebar:
                                help=f"허브가 필요할 때만 질문당 최대 {SEARCH_MAX_USES}회 검색합니다. "
                                     "Claude는 1,000회당 10달러가 Team 크레딧에서 차감됩니다."
                                     if can_search else f"{hub}는 웹 검색을 지원하지 않습니다.")
+        clarify_on = st.toggle("❓ 되묻기", value=bool(secret("CLARIFY", True)), key="r_clarify",
+                               help="토론 전에 허브가 질문을 살펴, 답이 크게 달라질 만한 모호한 점이 있으면 "
+                                    "선택형으로 먼저 물어봅니다. 물을 것이 없으면 바로 진행합니다.")
         fast = st.toggle("⚡ 빠른 모드 (토론 생략)", value=False, key="r_fast",
                          help="② 상호 토론을 건너뛰어 호출이 6회에서 4회로 줄고 더 빨리 끝납니다. "
                               "대신 서로의 오류를 바로잡는 과정이 빠집니다.")
@@ -1270,7 +1351,8 @@ with st.sidebar:
             st.caption("한도 초과 시 같은 AI의 낮은 모델로 자동 교체  \n" + "  \n".join(steps))
     calls = 4 if fast else 6
     summary.caption(f"🔮 {hub} 주재 · ⚖️ {a} vs {b}"
-                    + (" · 🔎" if web_search else "") + (" · ⚡" if fast else "") + f" · 호출 {calls}회")
+                    + (" · 🔎" if web_search else "") + (" · ❓" if clarify_on else "")
+                    + (" · ⚡" if fast else "") + f" · 호출 {calls}회")
 
     active = {k: t for k, t in cooldowns.items() if t > time.time()}
     if active:
@@ -1365,54 +1447,32 @@ def final_text(res):
     return split_report(f["text"])[0] if f and f["ok"] else ""
 
 
-# 지난 대화 다시 그리기
-if ss.conv_id and ss.img_count and not ss.conv_images:
-    st.info(f"이 대화에서 쓴 이미지 {ss.img_count}장은 기록에 저장되지 않습니다. "
-            "이어서 이미지에 대해 물어보려면 다시 첨부해 주세요. 문서 내용은 그대로 이어집니다.")
-for t in ss.turns:
-    with st.chat_message("user"):
-        st.markdown(t["q"])
-        for name in t["files"]:
-            st.caption(f"📎 {name}")
-    with st.chat_message("assistant", avatar="🔮"):
-        render_result(t["result"])
-
-msg = st.chat_input(
-    "질문을 입력하세요. 직전 결론에 대한 후속 질문도 됩니다. (📎로 PDF·TXT·MD·이미지 첨부)",
-    accept_file="multiple", file_type=["pdf", "txt", "md", *IMAGE_MIME.keys()],
-)
-
-if msg and (msg.text.strip() or msg.files):
-    question = msg.text.strip() or "첨부한 파일의 내용을 정리해 주세요."
-    new_names = [f.name for f in msg.files]
-
+def show_question(question, files, answers=None):
+    """사용자 질문 말풍선 (되묻기에 답한 내용 포함)."""
     with st.chat_message("user"):
         st.markdown(question)
-        for name in new_names:
+        for name in files:
             st.caption(f"📎 {name}")
+        for a in answers or []:
+            st.caption(f"❓ {a['q']} → **{a['a']}**")
 
-    # 새 첨부를 대화 전체 첨부에 누적
-    doc_text, images, warns = process_uploads(msg.files)
-    if doc_text:
-        merged = (ss.conv_docs + "\n\n" + doc_text).strip()
-        if len(merged) > MAX_DOC_CHARS:
-            merged = merged[-MAX_DOC_CHARS:]
-            warns.append(f"대화에 첨부된 문서가 길어 최근 {MAX_DOC_CHARS:,}자만 사용합니다.")
-        ss.conv_docs = merged
-    ss.conv_images += images
-    ss.conv_files += [n for n in new_names if n not in ss.conv_files]
 
-    ui = UserInput(
-        prompt=question, doc_text=ss.conv_docs, images=ss.conv_images,
-        history=[(t["q"], final_text(t["result"])) for t in ss.turns if final_text(t["result"])],
-    )
+def history_pairs():
+    return [(with_clarification(t["q"], t.get("clarify")), final_text(t["result"]))
+            for t in ss.turns if final_text(t["result"])]
 
+
+def make_input(question, answers=()):
+    return UserInput(prompt=with_clarification(question, answers), doc_text=ss.conv_docs,
+                     images=ss.conv_images, history=history_pairs())
+
+
+def run_turn(question, files, warns, answers):
+    """토론 실행 → 결과 표시 → 저장."""
+    ui = make_input(question, answers)
     with st.chat_message("assistant", avatar="🔮"):
         for w in warns:
             st.warning(w)
-        if None in models.values():
-            st.error("모델이 선택되지 않은 역할이 있습니다. 사이드바의 모델 선택을 확인하세요.")
-            st.stop()
         status = st.status("허브가 토론을 주재하는 중…", expanded=True)
         with status:
             board = ProgressBoard(roles, status)
@@ -1440,10 +1500,96 @@ if msg and (msg.text.strip() or msg.files):
                 st.error(str(e))
         if result:
             render_result(result)
-            ss.turns.append({"q": question, "files": new_names, "result": result})
+            ss.turns.append({"q": question, "clarify": list(answers), "files": files, "result": result})
             try:
                 save_conversation()
             except Exception as e:
                 st.warning(f"대화 기록 저장에 실패했습니다 ({str(e)[:80]}). 답변은 이 화면에 그대로 남습니다.")
                 time.sleep(3)
             st.rerun()
+
+
+# 지난 대화 다시 그리기
+if ss.conv_id and ss.img_count and not ss.conv_images:
+    st.info(f"이 대화에서 쓴 이미지 {ss.img_count}장은 기록에 저장되지 않습니다. "
+            "이어서 이미지에 대해 물어보려면 다시 첨부해 주세요. 문서 내용은 그대로 이어집니다.")
+for t in ss.turns:
+    show_question(t["q"], t["files"], t.get("clarify"))
+    with st.chat_message("assistant", avatar="🔮"):
+        render_result(t["result"])
+
+msg = st.chat_input(
+    "질문을 입력하세요. 직전 결론에 대한 후속 질문도 됩니다. (📎로 PDF·TXT·MD·이미지 첨부)",
+    accept_file="multiple", file_type=["pdf", "txt", "md", *IMAGE_MIME.keys()],
+)
+
+if msg and (msg.text.strip() or msg.files):
+    ss.pop("pending", None)               # 되묻는 중에 새 질문을 보내면 이전 확인은 버림
+    question = msg.text.strip() or "첨부한 파일의 내용을 정리해 주세요."
+    new_names = [f.name for f in msg.files]
+    show_question(question, new_names)
+
+    # 새 첨부를 대화 전체 첨부에 누적
+    doc_text, images, warns = process_uploads(msg.files)
+    if doc_text:
+        merged = (ss.conv_docs + "\n\n" + doc_text).strip()
+        if len(merged) > MAX_DOC_CHARS:
+            merged = merged[-MAX_DOC_CHARS:]
+            warns.append(f"대화에 첨부된 문서가 길어 최근 {MAX_DOC_CHARS:,}자만 사용합니다.")
+        ss.conv_docs = merged
+    ss.conv_images += images
+    ss.conv_files += [n for n in new_names if n not in ss.conv_files]
+
+    if None in models.values():
+        st.error("모델이 선택되지 않은 역할이 있습니다. 사이드바의 모델 선택을 확인하세요.")
+        st.stop()
+
+    questions = []
+    if clarify_on:
+        with st.chat_message("assistant", avatar="🔮"):
+            with st.spinner("허브가 질문을 확인하는 중…"):
+                questions = asyncio.run(hub_clarify(make_input(question), hub, models["hub"], cooldowns))
+    if questions:                         # 화면을 다시 그려 선택형 질문을 보여줌
+        ss.pending = {"id": pysecrets.token_hex(3), "q": question, "files": new_names,
+                      "warns": warns, "questions": questions}
+        st.rerun()
+    run_turn(question, new_names, warns, [])
+
+elif ss.get("pending"):
+    pend = ss.pending
+    show_question(pend["q"], pend["files"])
+    slot = st.empty()
+    with slot.container():
+        with st.chat_message("assistant", avatar="🔮"):
+            st.markdown("**❓ 토론 전에 확인할 점이 있습니다**")
+            st.caption("고른 내용에 맞춰 두 AI가 토론합니다. 고르지 않은 질문은 허브가 합리적으로 가정합니다.")
+            with st.form(f"clarify_{pend['id']}", border=True):
+                picks = []
+                for i, q in enumerate(pend["questions"]):
+                    key = f"cq_{pend['id']}_{i}"
+                    if q["multi"]:
+                        picks.append(st.multiselect(q["q"], q["options"], key=key, placeholder="여러 개 선택 가능"))
+                    else:
+                        picks.append(st.radio(q["q"], q["options"], index=None, key=key))
+                extra = st.text_input("기타·추가 설명 (선택)", key=f"cq_{pend['id']}_extra",
+                                      placeholder="선택지에 없는 내용이나 덧붙일 조건을 적어 주세요")
+                c1, c2 = st.columns(2)
+                go = c1.form_submit_button("답하고 토론 시작", type="primary", use_container_width=True)
+                skip = c2.form_submit_button("건너뛰고 그대로 진행", use_container_width=True)
+    if go or skip:
+        answers = []
+        if go:
+            for q, v in zip(pend["questions"], picks):
+                v = ", ".join(v) if isinstance(v, list) else v
+                if v:
+                    answers.append({"q": q["q"], "a": v})
+            if extra.strip():
+                answers.append({"q": "추가 설명", "a": extra.strip()})
+        ss.pop("pending", None)
+        slot.empty()
+        if answers:                       # 양식 자리에 고른 답만 남김
+            with slot.container():
+                with st.chat_message("user"):
+                    for a in answers:
+                        st.caption(f"❓ {a['q']} → **{a['a']}**")
+        run_turn(pend["q"], pend["files"], pend["warns"], answers)
