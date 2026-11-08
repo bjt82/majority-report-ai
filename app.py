@@ -1188,14 +1188,33 @@ def now_text():
 st.set_page_config(page_title=APP_NAME, page_icon="🔮", layout="wide")
 
 # 공개 URL에서 API 요금 도용을 막는 비밀번호 게이트
+PW_MAX_TRIES = 5                             # 연속으로 틀릴 수 있는 횟수
+PW_LOCK_SEC = 60                             # 그 뒤 잠그는 시간
 app_pw = secret("APP_PASSWORD")
+if not app_pw and not secret("ALLOW_NO_PASSWORD", False):
+    # 비밀번호가 없으면 링크를 아는 누구나 유료 API 크레딧을 쓸 수 있으므로 열지 않음
+    st.title(f"🔮 {APP_NAME}")
+    st.error("접속 비밀번호가 설정되지 않아 앱을 열 수 없습니다.\n\n"
+             "Streamlit Cloud → 앱 **Settings → Secrets**에 `APP_PASSWORD = \"원하는-비밀번호\"`를 추가하세요. "
+             "(혼자 쓰는 로컬 실행이라면 `ALLOW_NO_PASSWORD = true`로 끌 수 있습니다.)")
+    st.stop()
 if app_pw and not st.session_state.get("authed"):
     st.title(f"🔮 {APP_NAME}")
+    lock_left = st.session_state.get("pw_lock_until", 0) - time.time()
+    if lock_left > 0:
+        st.error(f"비밀번호를 {PW_MAX_TRIES}번 틀려 {lock_left:.0f}초 동안 잠겼습니다. 잠시 후 새로고침하세요.")
+        st.stop()
     entered = st.text_input("접속 비밀번호", type="password")
     if entered and hmac.compare_digest(entered, str(app_pw)):
         st.session_state.authed = True
+        st.session_state.pop("pw_fails", None)
         st.rerun()
     elif entered:
+        fails = st.session_state.get("pw_fails", 0) + 1
+        st.session_state.pw_fails = fails
+        if fails >= PW_MAX_TRIES:
+            st.session_state.pw_lock_until = time.time() + PW_LOCK_SEC
+            st.session_state.pw_fails = 0
         st.error("비밀번호가 틀렸습니다.")
     st.stop()
 

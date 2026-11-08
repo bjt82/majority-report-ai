@@ -53,5 +53,14 @@ Claude 응답의 실제 토큰 사용량과 웹 검색 횟수로 질문마다 �
 키가 있는 AI만 화면에 나타나고, 모델 목록은 각 API에서 자동으로 불러옵니다.
 설정 예시는 `secrets.toml.example`을 참고하세요.
 
-> ⚠️ API 키는 절대 커밋하지 마세요. `APP_PASSWORD`를 꼭 설정하세요.
+> ⚠️ API 키는 절대 커밋하지 마세요. `APP_PASSWORD`는 **필수**입니다. 설정하지 않으면 앱이 열리지 않으며, 5번 연속 틀리면 1분간 잠깁니다.
 > 일부 무료 API는 입력 내용을 학습에 사용할 수 있으니 개인정보가 담긴 파일은 올리지 마세요.
+
+## 시험
+AI API를 실제로 부르지 않고 가짜 응답으로 로직과 화면 흐름을 확인합니다. PR을 올리면 GitHub Actions가 자동으로 실행합니다.
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q tests
+```
+
