@@ -1652,10 +1652,13 @@ if msg and (msg.text.strip() or msg.files):
 
     questions, clarify_cost = [], 0.0
     if clarify_on:
-        with st.chat_message("assistant", avatar="🔮"):
-            with st.spinner("허브가 질문을 확인하는 중…"):
-                questions, clarify_cost = asyncio.run(
-                    hub_clarify(make_input(question), hub, models["hub"], cooldowns))
+        holder = st.empty()               # 확인이 끝나면 말풍선째 지워서 빈 칸이 남지 않게 함
+        with holder.container():
+            with st.chat_message("assistant", avatar="🔮"):
+                with st.spinner("허브가 질문을 확인하는 중…"):
+                    questions, clarify_cost = asyncio.run(
+                        hub_clarify(make_input(question), hub, models["hub"], cooldowns))
+        holder.empty()
     if questions:                         # 화면을 다시 그려 선택형 질문을 보여줌
         ss.pending = {"id": pysecrets.token_hex(3), "q": question, "files": new_names,
                       "warns": warns, "questions": questions, "cost": clarify_cost}
