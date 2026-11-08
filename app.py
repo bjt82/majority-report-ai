@@ -1213,13 +1213,19 @@ class ProgressBoard:
              ("a2", "② 반론 A"), ("b2", "② 반론 B"), ("verdict", "③ 최종 판정")]
     ICON = {"wait": "⬜", "run": "⏳", "ok": "✅", "fail": "❌", "skip": "⏭️"}
 
-    def __init__(self, roles, status):
+    def __init__(self, roles, status, models=None):
         self.t0 = time.time()
         self.status = status
-        who = {"brief": roles["hub"], "a1": roles["a"], "b1": roles["b"],
-               "a2": roles["a"], "b2": roles["b"], "verdict": roles["hub"]}
+        models = models or {}
+
+        def judge(k):                     # 허브와 같은 AI인 판단자는 모델명을 붙여 구분 (예: Claude · claude-haiku-5-5)
+            n = roles[k]
+            return f"{n} · {short(models[k])}" if n == roles["hub"] and models.get(k) else n
+        who = {"brief": roles["hub"], "a1": judge("a"), "b1": judge("b"),
+               "a2": judge("a"), "b2": judge("b"), "verdict": roles["hub"]}
         self.rows = {k: {"state": "wait", "name": who[k], "extra": "", "t": 0, "sec": 0, "preview": ""}
                      for k, _ in self.STEPS}
+        self.expanded = True              # 1초마다 라벨을 갱신할 때 펼침 상태를 함께 보내야 접히지 않음
         self.bar = st.progress(0.0, text="시작하는 중…")
         self.box = st.empty()
         self.notes = st.container()
@@ -1255,6 +1261,7 @@ class ProgressBoard:
         """최종 판정 글자를 받는 대로 표시. chunk=None이면 새로 시작(재시도)."""
         if chunk is None:
             self.streamed, self.last_draw = "", 0.0
+            self.expanded = False
             if self.status is not None:
                 self.status.update(expanded=False)       # 진행판을 접고 답에 집중
             return
@@ -1291,7 +1298,7 @@ class ProgressBoard:
         self.bar.progress(min(finished / len(self.STEPS), 1.0), text=f"{stage} · {elapsed}")
         self.box.markdown("  \n".join(lines))
         if self.status is not None:
-            self.status.update(label=f"{stage} · {elapsed}")
+            self.status.update(label=f"{stage} · {elapsed}", expanded=self.expanded)
 
     async def tick(self):
         while self.running:
@@ -1579,7 +1586,7 @@ def run_turn(question, files, warns, answers, extra_cost=0.0):
             st.warning(w)
         status = st.status("허브가 토론을 주재하는 중…", expanded=True)
         with status:
-            board = ProgressBoard(roles, status)
+            board = ProgressBoard(roles, status, models)
         board.live = st.empty()           # 최종 판정이 실시간으로 나타날 자리
         with status:
 
@@ -1696,10 +1703,11 @@ elif ss.get("pending"):
             if extra.strip():
                 answers.append({"q": "추가 설명", "a": extra.strip()})
         ss.pop("pending", None)
+        # 양식 자리는 비워 두기만 함. 같은 자리에 다른 말풍선을 바로 쓰면 Streamlit이 '비우기'를 생략해
+        # 제출한 양식이 토론 내내 흐리게 남고, 그 버튼을 다시 누르면 진행 중인 토론이 끊김.
         slot.empty()
-        if answers:                       # 양식 자리에 고른 답만 남김
-            with slot.container():
-                with st.chat_message("user"):
-                    for a in answers:
-                        st.caption(f"❓ {a['q']} → **{a['a']}**")
+        if answers:                       # 고른 답은 그 아래 새 자리에 표시
+            with st.chat_message("user"):
+                for a in answers:
+                    st.caption(f"❓ {a['q']} → **{a['a']}**")
         run_turn(pend["q"], pend["files"], pend["warns"], answers, pend.get("cost", 0.0))
