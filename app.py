@@ -141,8 +141,9 @@ class ProgressBoard:
             clean = (re.sub(r"[*_`#>|]", "", l).strip(" -") for l in res["text"].splitlines())
             line = next((l for l in clean if l), "")
             row["preview"] = line[:70] + ("…" if len(line) > 70 else "")
-            if res.get("searches"):
-                row["extra"] = f"웹 검색 {res['searches']}회 · 출처 {len(res.get('sources', []))}개"
+            if res.get("searches") or res.get("fetches") or res.get("browser_visits"):
+                row["extra"] = (f"검색 {res.get('searches', 0)}회 · 본문 {res.get('fetches', 0)}회"
+                                f" · 브라우저 {len(res.get('browser_visits', []))}회")
         else:
             row["preview"] = res["text"][:70]
         self.render()
@@ -346,7 +347,7 @@ with st.sidebar:
         web_search = st.toggle("🔎 웹 검색", value=can_search and bool(secret("WEB_SEARCH", True)),
                                disabled=not can_search, key="r_search",
                                help=f"허브가 필요할 때만 질문당 최대 {SEARCH_MAX_USES}회 검색합니다. "
-                                    "Claude는 1,000회당 10달러가 Team 크레딧에서 차감됩니다."
+                                    "Claude는 필요시 페이지·브라우저 조회도 사용하며, 시간과 입력 비용이 추가될 수 있습니다."
                                     if can_search else f"{hub}는 웹 검색을 지원하지 않습니다.")
         clarify_on = st.toggle("❓ 되묻기", value=bool(secret("CLARIFY", True)), key="r_clarify",
                                help="토론 전에 허브가 질문을 살펴, 답이 크게 달라질 만한 모호한 점이 있으면 "
@@ -523,10 +524,17 @@ def render_result(res):
                    + (" · 💰 " + cost_caption(result_costs(res)) if res.get("costs") or res.get("cost") else ""))
         if "costs" not in res:
             st.caption("이전 기록: Gemini 비용은 수집되지 않았습니다.")
-        if res.get("sources"):
-            with st.expander(f"🔎 허브가 확인한 출처 ({len(res['sources'])}개)"):
-                for src in res["sources"]:
+        visits = res.get("brief", {}).get("browser_visits", [])
+        if res.get("sources") or visits:
+            with st.expander(f"🔎 허브의 출처·조회 기록 ({len(res.get('sources', []))}개 출처)"):
+                for src in res.get("sources", []):
                     st.markdown(f"- [{src['title']}]({src['url']})")
+                for visit in visits:
+                    st.caption("브라우저 렌더링 " + ("완료" if visit.get("ok") else "실패")
+                               + " · " + (visit.get("title") or visit.get("url") or visit.get("error", ""))
+                               + (" · " + visit["retrieved_at"] if visit.get("retrieved_at") else ""))
+                if visits:
+                    st.caption("브라우저가 페이지를 읽었다는 기록입니다. 요청한 정보의 일치 여부는 답변 근거를 확인하세요.")
         if minor:
             with st.container(border=True):
                 st.markdown("**🔍 Minority Report** — 토론의 쟁점과 판정 근거")

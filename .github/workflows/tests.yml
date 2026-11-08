@@ -17,5 +17,9 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Install test browser
+        run: python -m playwright install --with-deps chromium --only-shell
       - name: Run tests
+        env:
+          BROWSER_TESTS: "1"
         run: python -m pytest -q tests

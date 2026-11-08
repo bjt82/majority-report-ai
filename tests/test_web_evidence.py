@@ -74,7 +74,7 @@ def test_rejecting_one_tool_preserves_the_other(core, rejected):
     assert out == "도구 제한을 반영한 답"
     assert len(bodies) == 3
     surviving = "web_search" if rejected == "web_fetch" else "web_fetch"
-    assert [t["name"] for t in bodies[-1]["tools"]] == [surviving]
+    assert [t["name"] for t in bodies[-1]["tools"]] == [surviving, "browser_read"]
     assert meta["search_note"]
     if rejected == "web_fetch":
         legacy = next(t for t in bodies[1]["tools"] if t["name"] == "web_fetch")
